@@ -1,0 +1,392 @@
+{
+  "info": {
+    "name": "Neobank onboarding — KYC",
+    "description": "Happy path plus the four failure cases that actually matter. The negative tests are the point: anyone can POST a valid application. Paths match workflow.n8n.json; contract in openapi.yaml.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:5678/webhook"
+    },
+    {
+      "key": "webhookSecret",
+      "value": "replace-me"
+    },
+    {
+      "key": "applicationId",
+      "value": ""
+    },
+    {
+      "key": "idemKey",
+      "value": ""
+    }
+  ],
+  "item": [
+    {
+      "name": "1. Submit application (201)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// Deterministic key from the business event, not the attempt.",
+              "const ref = 'CUST-' + Math.floor(Math.random() * 100000);",
+              "pm.collectionVariables.set('customerRef', ref);",
+              "pm.collectionVariables.set('idemKey', 'key-' + ref + '-CURRENT_ACCOUNT_EUR');"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('201 created', () => pm.response.to.have.status(201));",
+              "const b = pm.response.json();",
+              "pm.collectionVariables.set('applicationId', b.application_id);",
+              "pm.test('has application id', () => pm.expect(b.application_id).to.be.a('string'));",
+              "pm.test('no KYC decision taken synchronously', () =>",
+              "  pm.expect(['kyc_pending','kyc_review','kyc_unknown']).to.include(b.state));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "{{idemKey}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customer_external_ref\": \"{{customerRef}}\",\n  \"product_code\": \"CURRENT_ACCOUNT_EUR\",\n  \"applicant\": {\n    \"given_name\": \"Jonas\",\n    \"family_name\": \"Petraitis\",\n    \"date_of_birth\": \"1991-04-17\",\n    \"country\": \"LT\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/applications",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "applications"
+          ]
+        }
+      }
+    },
+    {
+      "name": "2. Replay same key, same body (200, no duplicate)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('200 replay, not 201', () => pm.response.to.have.status(200));",
+              "pm.test('same application, no duplicate created', () =>",
+              "  pm.expect(pm.response.json().application_id)",
+              "    .to.eql(pm.collectionVariables.get('applicationId')));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "{{idemKey}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customer_external_ref\": \"{{customerRef}}\",\n  \"product_code\": \"CURRENT_ACCOUNT_EUR\",\n  \"applicant\": {\n    \"given_name\": \"Jonas\",\n    \"family_name\": \"Petraitis\",\n    \"date_of_birth\": \"1991-04-17\",\n    \"country\": \"LT\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/applications",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "applications"
+          ]
+        }
+      }
+    },
+    {
+      "name": "3. Same key, DIFFERENT body (409)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('409 — key reuse with different payload', () => pm.response.to.have.status(409));",
+              "pm.test('names the reason', () =>",
+              "  pm.expect(pm.response.json().error).to.eql('idempotency_key_reuse_with_different_payload'));",
+              "// Why this matters: silently returning the original would mask a",
+              "// client bug, or an attempt to swap the applicant behind a known key."
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "Idempotency-Key",
+            "value": "{{idemKey}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"customer_external_ref\": \"{{customerRef}}\",\n  \"product_code\": \"CURRENT_ACCOUNT_EUR\",\n  \"applicant\": {\n    \"given_name\": \"SOMEONE\",\n    \"family_name\": \"ELSE\",\n    \"date_of_birth\": \"1970-01-01\",\n    \"country\": \"LT\"\n  }\n}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/applications",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "applications"
+          ]
+        }
+      }
+    },
+    {
+      "name": "4. KYC callback — valid signature (200)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// Sign exactly what we send: {timestamp}.{raw body}",
+              "const ts = Math.floor(Date.now() / 1000).toString();",
+              "const eventId = 'evt-' + ts + '-' + Math.floor(Math.random() * 1000);",
+              "pm.collectionVariables.set('eventId', eventId);",
+              "const body = JSON.stringify({",
+              "  event_id: eventId,",
+              "  check_id: 'chk-123',",
+              "  client_reference: pm.collectionVariables.get('applicationId'),",
+              "  sequence: 1,",
+              "  decision: 'CLEAR'",
+              "});",
+              "pm.collectionVariables.set('cbBody', body);",
+              "pm.collectionVariables.set('cbTs', ts);",
+              "const sig = CryptoJS.HmacSHA256(ts + '.' + body,",
+              "  pm.collectionVariables.get('webhookSecret')).toString(CryptoJS.enc.Hex);",
+              "pm.collectionVariables.set('cbSig', sig);"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('200 accepted', () => pm.response.to.have.status(200));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Provider-Signature",
+            "value": "{{cbSig}}"
+          },
+          {
+            "key": "X-Provider-Timestamp",
+            "value": "{{cbTs}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{{cbBody}}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/kyc-callback",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "kyc-callback"
+          ]
+        }
+      }
+    },
+    {
+      "name": "5. Same callback replayed (200, applied once)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('200 — duplicate is normal traffic, not an error', () => pm.response.to.have.status(200));",
+              "// The transition is keyed on event_id, so the state cannot move twice."
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Provider-Signature",
+            "value": "{{cbSig}}"
+          },
+          {
+            "key": "X-Provider-Timestamp",
+            "value": "{{cbTs}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{{cbBody}}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/kyc-callback",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "kyc-callback"
+          ]
+        }
+      }
+    },
+    {
+      "name": "6. KYC callback — tampered body (401)",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('401 — signature must be over the raw body', () => pm.response.to.have.status(401));",
+              "pm.test('reason is bad_signature', () =>",
+              "  pm.expect(pm.response.json().reason).to.eql('bad_signature'));",
+              "// Same signature, one byte changed in the payload: DECLINE→CLEAR.",
+              "// If this ever returns 200, the signature check is decorative."
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Provider-Signature",
+            "value": "{{cbSig}}"
+          },
+          {
+            "key": "X-Provider-Timestamp",
+            "value": "{{cbTs}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"event_id\":\"{{eventId}}\",\"check_id\":\"chk-123\",\"client_reference\":\"{{applicationId}}\",\"sequence\":1,\"decision\":\"CLEAR\",\"tampered\":true}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/kyc-callback",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "kyc-callback"
+          ]
+        }
+      }
+    },
+    {
+      "name": "7. KYC callback — stale timestamp (401)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "// Correctly signed, but an hour old: a captured payload must not",
+              "// replay forever.",
+              "const ts = (Math.floor(Date.now() / 1000) - 3600).toString();",
+              "const body = JSON.stringify({ event_id: 'evt-stale', check_id: 'chk-9',",
+              "  client_reference: pm.collectionVariables.get('applicationId'), decision: 'CLEAR' });",
+              "pm.collectionVariables.set('staleBody', body);",
+              "pm.collectionVariables.set('staleTs', ts);",
+              "pm.collectionVariables.set('staleSig',",
+              "  CryptoJS.HmacSHA256(ts + '.' + body, pm.collectionVariables.get('webhookSecret')).toString(CryptoJS.enc.Hex));"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "pm.test('401 — outside replay window', () => pm.response.to.have.status(401));",
+              "pm.test('reason names the tolerance', () =>",
+              "  pm.expect(pm.response.json().reason).to.eql('timestamp_outside_tolerance'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          },
+          {
+            "key": "X-Provider-Signature",
+            "value": "{{staleSig}}"
+          },
+          {
+            "key": "X-Provider-Timestamp",
+            "value": "{{staleTs}}"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{{staleBody}}"
+        },
+        "url": {
+          "raw": "{{baseUrl}}/onboarding/kyc-callback",
+          "host": [
+            "{{baseUrl}}"
+          ],
+          "path": [
+            "onboarding",
+            "kyc-callback"
+          ]
+        }
+      }
+    }
+  ]
+}

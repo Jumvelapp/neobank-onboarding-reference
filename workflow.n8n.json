@@ -1,0 +1,1406 @@
+{
+  "name": "Neobank onboarding — KYC (reference)",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "onboarding/applications",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "90055195-19a6-5bb9-846b-596ee4f12352",
+      "name": "Webhook: Submit application",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -900,
+        0
+      ],
+      "webhookId": "a1f0c9d2-0001-4a10-9f01-000000000001"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------\n// Idempotency resolution — two rules that keep a bank out of trouble:\n//  1. The key is derived from the BUSINESS EVENT, never from the attempt.\n//     Same person + same product = same application, however many times\n//     the client retries.\n//  2. Same key + DIFFERENT payload must 409 (the database answers that).\n//     Silently returning the original would hide a client bug, or an\n//     attempt to swap the applicant behind a key that is already known.\n// Malformed input is a 400 here; no application is created for it.\n// ---------------------------------------------------------------\nconst crypto = require('crypto');   // needs NODE_FUNCTION_ALLOW_BUILTIN=crypto\n\nconst body    = $input.first().json.body ?? {};\nconst headers = $input.first().json.headers ?? {};\n\nconst customerRef = String(body.customer_external_ref ?? '').trim();\nconst product     = String(body.product_code ?? '').trim();\nconst a           = body.applicant;\n\nconst problems = [];\nif (!customerRef) problems.push('customer_external_ref is required');\nif (!product)     problems.push('product_code is required');\nif (!a || typeof a !== 'object' || Array.isArray(a)) problems.push('applicant must be an object');\nelse {\n  for (const f of ['given_name', 'family_name', 'date_of_birth', 'country'])\n    if (!String(a[f] ?? '').trim()) problems.push(`applicant.${f} is required`);\n  if (a.date_of_birth && !/^\\d{4}-\\d{2}-\\d{2}$/.test(a.date_of_birth)) problems.push('applicant.date_of_birth must be YYYY-MM-DD');\n  if (a.country && !/^[A-Z]{2}$/.test(a.country)) problems.push('applicant.country must be ISO 3166-1 alpha-2');\n}\nif (problems.length) return [{ json: { _halt: true, status: 400, error: 'validation_failed', problems } }];\n\n// Client MAY supply a key. If it does not, derive a deterministic one —\n// so a client that forgets the header still cannot create duplicates.\nconst clientKey = headers['idempotency-key'];\nconst idempotencyKey = clientKey\n  ? String(clientKey)\n  : crypto.createHash('sha256').update(`${customerRef}:${product}`).digest('hex');\n\n// Fingerprint the fields that define the request, with keys sorted at EVERY\n// depth. (JSON.stringify's replacer-array would also filter nested keys and\n// silently fingerprint the applicant as {} — the 409 would never fire.)\nconst canonical = (v) => Array.isArray(v) ? `[${v.map(canonical).join(',')}]`\n  : v && typeof v === 'object'\n    ? `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${canonical(v[k])}`).join(',')}}`\n    : JSON.stringify(v);\n\nconst requestFingerprint = crypto.createHash('sha256')\n  .update(canonical({ customer_external_ref: customerRef, product_code: product, applicant: a }))\n  .digest('hex');\n\nreturn [{ json: {\n  _halt: false,\n  customer_external_ref: customerRef,\n  product_code: product,\n  applicant: a,\n  idempotency_key: idempotencyKey,\n  request_fingerprint: requestFingerprint\n} }];\n"
+      },
+      "id": "642383a4-030a-584b-8456-2ef32c952c19",
+      "name": "Resolve idempotency",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "51ed375b-ee45-58a4-a3a4-2493060d5946",
+              "leftValue": "={{ $json._halt }}",
+              "rightValue": "={{ false }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "a00d88bd-c011-50c2-bf6b-f36dbd19dc71",
+      "name": "IF: well-formed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -460,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- Find-or-create in the database, not in the workflow: two concurrent\n-- submits produce one application and both callers get it back.\n-- outcome: created | replay | key_conflict | already_open\nselect * from app.submit_application($1, $2, $3::jsonb, $4, $5);",
+        "options": {
+          "queryReplacement": "={{ [ $json.customer_external_ref, $json.product_code, JSON.stringify($json.applicant), $json.idempotency_key, $json.request_fingerprint ] }}"
+        }
+      },
+      "id": "eaada62c-0e00-5509-aaef-9de0db90bbbb",
+      "name": "PG: submit application",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -240,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "2c46425f-12f5-5661-819a-e229aa04a76e",
+              "leftValue": "={{ $json.outcome }}",
+              "rightValue": "created",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "7fb68e87-3df6-5a76-821c-c8338ddb1521",
+      "name": "IF: created?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Business eligibility, after the application exists — so a decline is an\n// audited state (rejected, with a reason), not a lost HTTP error.\n// The country list is illustrative.\nconst app = $('PG: submit application').first().json;\nconst a   = $('Resolve idempotency').first().json.applicant;\n\nconst SUPPORTED = ['AT','BE','DE','EE','ES','FI','FR','IE','IT','LT','LV','NL','PL','PT','SE'];\nconst dob  = new Date(a.date_of_birth + 'T00:00:00Z');\nconst now  = new Date();\nlet age    = now.getUTCFullYear() - dob.getUTCFullYear();\nif (now.getUTCMonth() < dob.getUTCMonth() ||\n   (now.getUTCMonth() === dob.getUTCMonth() && now.getUTCDate() < dob.getUTCDate())) age--;\n\nconst reason = Number.isNaN(age) ? 'invalid_date_of_birth'\n             : age < 18           ? 'under_18'\n             : !SUPPORTED.includes(a.country) ? 'country_not_supported'\n             : null;\n\nreturn [{ json: {\n  application_id: app.application_id,\n  next: reason ? 'rejected' : 'screening',\n  reason: reason ?? 'eligible',\n  tkey: `${app.application_id}:eligibility`\n} }];\n"
+      },
+      "id": "1568f40e-59c3-50c0-bd94-65aef3a3a0cd",
+      "name": "Check eligibility",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "eb886d3f-7991-5534-b349-4753448fc7a6",
+      "name": "PG: transition (eligibility)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        420,
+        0
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "939aa656-2996-53c9-9024-1f33bbd7c1f4",
+              "leftValue": "={{ $json.state }}",
+              "rightValue": "screening",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "8ffd6a45-1eb4-5eee-b83b-46052dcf36d0",
+      "name": "IF: eligible?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        640,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SCREENING_URL }}/screen",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.application_id }}:screen"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ reference: $json.application_id, applicant: $('Resolve idempotency').first().json.applicant }) }}"
+      },
+      "id": "aeab2d14-e63c-5509-958f-926faf64f2c5",
+      "name": "Sanctions / PEP screening",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        860,
+        -160
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "KYC provider API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// A screening HIT is never auto-rejected and never auto-approved — it goes\n// to a human, because that is a regulatory decision, not a workflow branch.\n// Screening being unavailable is not a rejection either.\nconst res   = $input.first().json;\nconst appId = $('PG: transition (eligibility)').first().json.application_id;\n\nconst ok   = res.statusCode >= 200 && res.statusCode < 300;\nconst hits = ok ? (res.body?.matches ?? []) : null;\n\nconst next   = !ok ? 'kyc_review' : hits.length > 0 ? 'kyc_review' : 'kyc_pending';\nconst reason = !ok ? 'screening_unavailable' : hits.length > 0 ? 'sanctions_hit' : 'screening_clear';\n\nreturn [{ json: { application_id: appId, next, reason, tkey: `${appId}:screening` } }];\n"
+      },
+      "id": "d0927d4b-a103-5704-8103-d6c7c61e7af7",
+      "name": "Route on screening",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1080,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "5ea6f5b5-51c8-5f44-bd9b-ec8d279c32cb",
+      "name": "PG: transition (screening)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1300,
+        -160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "e628fc2d-6db4-527d-b2ce-c261beb10a65",
+              "leftValue": "={{ $json.state }}",
+              "rightValue": "kyc_pending",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "6697146d-1a2f-5872-a437-f4bddc5776ba",
+      "name": "IF: cleared?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1520,
+        -160
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.KYC_PROVIDER_URL }}/checks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.application_id }}:kyc"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
+      },
+      "id": "837dd39a-1a86-50b7-8930-06a777fe4cad",
+      "name": "Submit to KYC provider",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1740,
+        -320
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "KYC provider API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: transition (screening)').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:submit-result` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:submit-result` }, pairedItem: i });\n  }\n});\nreturn out;\n"
+      },
+      "id": "d23004ab-bf66-5866-8954-ca3e6db77b3b",
+      "name": "Classify submit result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1960,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "b1d1efff-9c31-5f84-a3da-e4d9f05a0570",
+              "leftValue": "={{ $json.next }}",
+              "rightValue": "kyc_pending",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "66684b62-74bb-58db-8dfe-6b3d390069e2",
+      "name": "IF: provider accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2180,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- 2xx from the provider: state stays kyc_pending, we only keep its reference.\nselect $1::uuid as application_id, r.* from app.record_provider_ref($1::uuid, $2) r;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.provider_ref ] }}"
+        }
+      },
+      "id": "158314ac-f44e-522f-9711-2a91507e6d0c",
+      "name": "PG: record provider ref",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2400,
+        -420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "a647b8c4-c1fa-5bac-9be8-980b1cffe542",
+      "name": "PG: transition (submit result)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2400,
+        -220
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// One place that turns what happened into an HTTP answer.\nconst resolved = $('Resolve idempotency').first().json;\nif (resolved._halt) {\n  return [{ json: { http_status: resolved.status,\n                    response: { error: resolved.error, problems: resolved.problems } } }];\n}\n\nconst sub = $('PG: submit application').first().json;\nconst latest = $input.first().json;           // output of the last step that ran\n\nswitch (sub.outcome) {\n  case 'key_conflict':\n    return [{ json: { http_status: 409, response: {\n      error: 'idempotency_key_reuse_with_different_payload', application_id: sub.application_id } } }];\n  case 'already_open':\n    return [{ json: { http_status: 409, response: {\n      error: 'application_already_open', application_id: sub.application_id, state: sub.state } } }];\n  case 'replay':\n    // Return current state; never restart the process.\n    return [{ json: { http_status: 200, response: {\n      application_id: sub.application_id, state: sub.state, version: Number(sub.version) } } }];\n  default:\n    return [{ json: { http_status: 201, response: {\n      application_id: sub.application_id, state: latest.state ?? sub.state } } }];\n}\n"
+      },
+      "id": "8f03340b-1f76-5d79-81e0-b040a3ef75b7",
+      "name": "Shape response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2620,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseCode": "={{ $json.http_status }}"
+        }
+      },
+      "id": "b5515e11-ea26-5f60-8dc9-ec424f042fd6",
+      "name": "Respond",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        2840,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "onboarding/kyc-callback",
+        "responseMode": "responseNode",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "3d296c9b-d330-55d7-9f94-bf6fe6b18373",
+      "name": "Webhook: KYC callback",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        -900,
+        520
+      ],
+      "webhookId": "a1f0c9d2-0002-4a10-9f01-000000000002"
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---------------------------------------------------------------\n// Inbound webhook hardening. Four separate concerns, all mandatory:\n//\n//  1. Verify HMAC over the RAW bytes, BEFORE parsing. With rawBody on, n8n\n//     keeps the exact bytes as binary 'data'; json.body is already a parse.\n//     Re-serialising a parse changes bytes and the signature never matches\n//     — and \"fixing\" that by trusting the parse means no signature check.\n//  2. Constant-time compare. A fast-fail === leaks the signature by timing.\n//  3. Timestamp tolerance. Without it a captured payload replays forever.\n//  4. Only THEN look at the contents.\n// ---------------------------------------------------------------\nconst crypto = require('crypto');   // needs NODE_FUNCTION_ALLOW_BUILTIN=crypto\n\nconst item    = $input.first();\nconst headers = item.json.headers ?? {};\nconst reject  = (reason) => [{ json: { _ok: false, status: 401, reason } }];\n\nconst secret    = $env.KYC_WEBHOOK_SECRET;\nconst signature = String(headers['x-provider-signature'] ?? '');\nconst timestamp = String(headers['x-provider-timestamp'] ?? '');\n\nif (!secret)                  return reject('server_misconfigured_no_secret');\nif (!signature || !timestamp) return reject('missing_signature_headers');\nif (!item.binary?.data)       return reject('raw_body_unavailable');\n\n// 3. Replay window — five minutes either side of now.\nconst skew = Math.abs(Date.now() / 1000 - Number(timestamp));\nif (!Number.isFinite(skew) || skew > 300) return reject('timestamp_outside_tolerance');\n\n// 1. Sign exactly what was sent: timestamp + '.' + raw bytes.\nconst raw      = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst expected = crypto.createHmac('sha256', secret)\n                       .update(Buffer.concat([Buffer.from(`${timestamp}.`), raw]))\n                       .digest('hex');\n\n// 2. Constant-time. Lengths must match first or timingSafeEqual throws.\nconst a = Buffer.from(expected, 'utf8');\nconst b = Buffer.from(signature, 'utf8');\nif (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return reject('bad_signature');\n\n// 4. Trusted from here on.\nlet payload;\ntry { payload = JSON.parse(raw.toString('utf8')); }\ncatch { return reject('unparseable_body'); }\nif (!payload.event_id || !payload.client_reference) return reject('incomplete_event');\n\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\n\nreturn [{ json: {\n  _ok: true,\n  event_id:       String(payload.event_id),\n  provider_ref:   String(payload.check_id ?? ''),\n  application_id: payload.client_reference,\n  sequence_no:    payload.sequence ?? null,\n  decision:       payload.decision,\n  next:           decisionMap[payload.decision] ?? 'kyc_review',\n  reason:         `provider_${payload.decision ?? 'UNKNOWN'}`,\n  // Transition idempotency key = the provider's event id: replaying the\n  // same event can never produce a second transition.\n  tkey:           `event:${payload.event_id}`,\n  payload\n} }];\n"
+      },
+      "id": "49927291-3964-5a9d-9463-eb355766906f",
+      "name": "Verify HMAC (raw body)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "8a44037d-7671-55ee-8797-198776e18621",
+              "leftValue": "={{ $json._ok }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b42709c7-5faf-5de9-956a-6b16a438cb12",
+      "name": "IF: signature valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -460,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- At-least-once delivery: the same event WILL arrive twice.\n-- is_new answers \"have we seen this?\" atomically.\nselect * from app.record_provider_event($1, $2, $3, $4::bigint, $5::jsonb);",
+        "options": {
+          "queryReplacement": "={{ [ $json.event_id, $json.provider_ref, String($json.decision), $json.sequence_no, JSON.stringify($json.payload) ] }}"
+        }
+      },
+      "id": "06496a30-4f3a-5f7a-bb28-e6ec8008c340",
+      "name": "PG: record provider event",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -240,
+        520
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "10bbc54f-ffe1-57c2-b74d-fd4de27bcbe9",
+              "leftValue": "={{ $json.is_new }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "56801b27-9fbe-5e4e-a4c4-1269707213b2",
+      "name": "IF: new event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Back to the verified event (the Postgres step replaced $json).\nreturn [{ json: $('Verify HMAC (raw body)').first().json }];\n"
+      },
+      "id": "99445a16-2350-5614-96ea-3a385a3aecc2",
+      "name": "Decision from event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        420
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- A stale or out-of-order callback needs no special handling: a decided\n-- application has no allowed transition, so the database answers\n-- 'forbidden' and nothing changes. The callback is still acknowledged.\n\n-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "5c059e1c-1a1c-55c3-a59f-a69b863daef5",
+      "name": "PG: apply decision",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        420,
+        420
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "a737575c-c3d4-5b8c-b89f-bec3456522e2",
+      "name": "Respond 200",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        640,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, reason: $json.reason }) }}",
+        "options": {
+          "responseCode": 401
+        }
+      },
+      "id": "27c571cd-3c9f-5b6a-9468-0bb416044a1f",
+      "name": "Respond 401",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [
+        -240,
+        700
+      ]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "minutes",
+              "minutesInterval": 5
+            }
+          ]
+        }
+      },
+      "id": "3776b5ed-dd31-52b7-8a58-520ed87b143d",
+      "name": "Every 5 min: reconcile",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        -900,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- No callback within the SLA → kyc_unknown, so the claim below picks it up\n-- and the provider is asked directly. The BPMN boundary timer, in SQL.\nselect * from app.flag_overdue_pending(interval '6 hours');"
+      },
+      "id": "7a5ee980-e683-52b4-8a4f-37f42dcba109",
+      "name": "PG: flag overdue (SLA)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -790,
+        1160
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- SKIP LOCKED: run as many reconciler workers as you like, none of them\n-- will ever resolve the same application twice. Claiming also pushes the\n-- next attempt out (exponential back-off with jitter).\nselect * from app.claim_unknown_applications(25);"
+      },
+      "id": "a5d43fcc-7bfe-500e-b261-2276ca2f53a7",
+      "name": "PG: claim UNKNOWN",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -680,
+        1000
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{ $env.KYC_PROVIDER_URL }}/checks?client_reference={{ $json.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        }
+      },
+      "id": "18201426-816b-5766-ba45-c30cffdc797a",
+      "name": "Query provider by our ref",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -460,
+        1000
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "KYC provider API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// QUERY FIRST, resubmit second — and only when we are certain the provider\n// never received it. Blind resubmission is how one applicant becomes two\n// identities. Handles every claimed application, not just the first.\nconst MAX_ATTEMPTS = 8;\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\nconst out = [];\n\n$input.all().forEach((item, i) => {\n  const res   = item.json;\n  const app   = $('PG: claim UNKNOWN').itemMatching(i).json;\n  const code  = res.statusCode ?? 0;\n  const check = res.body?.data?.[0];\n  const emit  = (next, reason, tkey) =>\n    out.push({ json: { application_id: app.id, next, reason, tkey,\n                       kyc_attempts: app.kyc_attempts }, pairedItem: i });\n\n  if (code === 200 && check && check.status === 'complete') {\n    // Found, and finished → apply the real decision.\n    emit(decisionMap[check.result] ?? 'kyc_review', `reconciled_${check.result}`, `recon:${app.id}:${check.id}`);\n  } else if (code === 200 && check) {\n    // Found, still running → leave it; back-off is already re-armed.\n  } else if (code === 200 && !check && app.kyc_attempts < MAX_ATTEMPTS) {\n    // Definitively never received → resubmit with the SAME idempotency key.\n    emit('kyc_pending', 'never_received_resubmitting_same_key', `rearm:${app.id}:${app.kyc_attempts}`);\n  } else if (app.kyc_attempts >= MAX_ATTEMPTS) {\n    // Budget spent (or provider still unreachable on the last try) → a human\n    // owns it now. Note: kyc_review, never rejected.\n    emit('kyc_review', 'reconcile_exhausted', `giveup:${app.id}`);\n  }\n  // else: provider unreachable, budget left → try again next pass.\n});\nreturn out;\n"
+      },
+      "id": "7457efa6-a68d-5953-a0e8-95c3a56da485",
+      "name": "Resolve or re-arm",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "19577c25-5092-5aaf-88ca-1b3eef2f83ad",
+      "name": "PG: apply reconciled state",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -20,
+        1000
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d832b887-36f5-594c-8909-b61ab8903937",
+              "leftValue": "={{ $json.result === \"applied\" && $json.state === \"kyc_pending\" }}",
+              "rightValue": "={{ true }}",
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "2db3a483-747d-50b6-922a-b9d0d24979ef",
+      "name": "IF: re-armed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        200,
+        1000
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.KYC_PROVIDER_URL }}/checks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.application_id }}:kyc"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
+      },
+      "id": "21263104-aac6-53e7-96e5-5cd3a6f3920a",
+      "name": "Resubmit to KYC (same key)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        420,
+        900
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "KYC provider API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: apply reconciled state').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:resubmit:${$('Resolve or re-arm').itemMatching(i).json.kyc_attempts}` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:resubmit:${$('Resolve or re-arm').itemMatching(i).json.kyc_attempts}` }, pairedItem: i });\n  }\n});\nreturn out;\n"
+      },
+      "id": "e58ae59b-a97f-564e-abfa-f36fbd4c48e0",
+      "name": "Classify resubmit result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        640,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d59fd051-28bb-5c9a-8681-bc02e8fad150",
+              "leftValue": "={{ $json.next }}",
+              "rightValue": "kyc_pending",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "da38aedd-137e-5749-a61b-8a3ab69f8b9c",
+      "name": "IF: resubmit accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        860,
+        900
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- 2xx from the provider: state stays kyc_pending, we only keep its reference.\nselect $1::uuid as application_id, r.* from app.record_provider_ref($1::uuid, $2) r;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.provider_ref ] }}"
+        }
+      },
+      "id": "3681aa35-b7b4-5227-b7ff-fe9d56615378",
+      "name": "PG: record provider ref (resubmit)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1080,
+        800
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "8c275994-f3f4-55c3-9788-2e15d7418f23",
+      "name": "PG: transition (resubmit result)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1080,
+        1000
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook: Submit application": {
+      "main": [
+        [
+          {
+            "node": "Resolve idempotency",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve idempotency": {
+      "main": [
+        [
+          {
+            "node": "IF: well-formed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: well-formed?": {
+      "main": [
+        [
+          {
+            "node": "PG: submit application",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: submit application": {
+      "main": [
+        [
+          {
+            "node": "IF: created?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: created?": {
+      "main": [
+        [
+          {
+            "node": "Check eligibility",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check eligibility": {
+      "main": [
+        [
+          {
+            "node": "PG: transition (eligibility)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: transition (eligibility)": {
+      "main": [
+        [
+          {
+            "node": "IF: eligible?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: eligible?": {
+      "main": [
+        [
+          {
+            "node": "Sanctions / PEP screening",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanctions / PEP screening": {
+      "main": [
+        [
+          {
+            "node": "Route on screening",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route on screening": {
+      "main": [
+        [
+          {
+            "node": "PG: transition (screening)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: transition (screening)": {
+      "main": [
+        [
+          {
+            "node": "IF: cleared?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: cleared?": {
+      "main": [
+        [
+          {
+            "node": "Submit to KYC provider",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Shape response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit to KYC provider": {
+      "main": [
+        [
+          {
+            "node": "Classify submit result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify submit result": {
+      "main": [
+        [
+          {
+            "node": "IF: provider accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: provider accepted?": {
+      "main": [
+        [
+          {
+            "node": "PG: record provider ref",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG: transition (submit result)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: record provider ref": {
+      "main": [
+        [
+          {
+            "node": "Shape response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: transition (submit result)": {
+      "main": [
+        [
+          {
+            "node": "Shape response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Shape response": {
+      "main": [
+        [
+          {
+            "node": "Respond",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: KYC callback": {
+      "main": [
+        [
+          {
+            "node": "Verify HMAC (raw body)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify HMAC (raw body)": {
+      "main": [
+        [
+          {
+            "node": "IF: signature valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: signature valid?": {
+      "main": [
+        [
+          {
+            "node": "PG: record provider event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 401",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: record provider event": {
+      "main": [
+        [
+          {
+            "node": "IF: new event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: new event?": {
+      "main": [
+        [
+          {
+            "node": "Decision from event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Decision from event": {
+      "main": [
+        [
+          {
+            "node": "PG: apply decision",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: apply decision": {
+      "main": [
+        [
+          {
+            "node": "Respond 200",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Every 5 min: reconcile": {
+      "main": [
+        [
+          {
+            "node": "PG: flag overdue (SLA)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: flag overdue (SLA)": {
+      "main": [
+        [
+          {
+            "node": "PG: claim UNKNOWN",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: claim UNKNOWN": {
+      "main": [
+        [
+          {
+            "node": "Query provider by our ref",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query provider by our ref": {
+      "main": [
+        [
+          {
+            "node": "Resolve or re-arm",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resolve or re-arm": {
+      "main": [
+        [
+          {
+            "node": "PG: apply reconciled state",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "PG: apply reconciled state": {
+      "main": [
+        [
+          {
+            "node": "IF: re-armed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: re-armed?": {
+      "main": [
+        [
+          {
+            "node": "Resubmit to KYC (same key)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Resubmit to KYC (same key)": {
+      "main": [
+        [
+          {
+            "node": "Classify resubmit result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify resubmit result": {
+      "main": [
+        [
+          {
+            "node": "IF: resubmit accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: resubmit accepted?": {
+      "main": [
+        [
+          {
+            "node": "PG: record provider ref (resubmit)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG: transition (resubmit result)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}

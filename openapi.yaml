@@ -1,0 +1,180 @@
+openapi: 3.1.0
+info:
+  title: Neobank onboarding — KYC
+  version: "1.1.0"
+  description: |
+    Contract for the two webhooks in `workflow.n8n.json`. Paths match the
+    workflow exactly (n8n serves them under `/webhook`).
+
+    **Idempotency.** `POST /onboarding/applications` is idempotent on
+    `Idempotency-Key`. The key must be derived from the business event
+    (customer + product), never from the attempt. Replaying with the same key
+    returns the existing application and does not restart the process.
+    Replaying the same key with a *different* body returns 409 — silently
+    returning the original would hide a client bug, or an attempt to swap the
+    applicant behind a key that is already known.
+
+    **The decision is asynchronous.** A successful submit returns
+    `kyc_pending`; the provider decides later and calls
+    `/onboarding/kyc-callback`. A timeout on the provider call leads to
+    `kyc_unknown` and reconciliation — never to a decline.
+
+servers:
+  - url: http://localhost:5678/webhook
+    description: n8n, as in the Postman collection
+
+paths:
+  /onboarding/applications:
+    post:
+      summary: Submit an onboarding application (idempotent)
+      operationId: submitApplication
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema: { type: string, maxLength: 255 }
+          description: >
+            Omit it and the server derives sha256(customer_external_ref:product_code),
+            so a client that forgets the header still cannot create duplicates.
+            A rejected applicant reapplying is a new business event and needs a new key.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ApplicationRequest' }
+      responses:
+        '201':
+          description: >
+            Application created and processed as far as it synchronously can.
+            `state` is where it got to: `kyc_pending` (sent to the provider),
+            `kyc_review` (screening hit or unavailable, or the provider refused
+            the request), `kyc_unknown` (provider call indeterminate), or
+            `rejected` (ineligible — under 18, unsupported country).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationResponse' }
+        '200':
+          description: Idempotent replay — the existing application, current state, process not restarted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ApplicationResponse' }
+        '400':
+          description: Malformed request. Nothing is stored.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string, example: validation_failed }
+                  problems: { type: array, items: { type: string } }
+        '409':
+          description: >
+            `idempotency_key_reuse_with_different_payload` — same key, different body.
+            `application_already_open` — this customer already has a live application
+            for this product under another key.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    enum: [idempotency_key_reuse_with_different_payload, application_already_open]
+                  application_id: { type: string, format: uuid }
+                  state: { $ref: '#/components/schemas/State' }
+
+  /onboarding/kyc-callback:
+    post:
+      summary: Asynchronous KYC decision from the provider
+      operationId: kycCallback
+      description: |
+        Signed with HMAC-SHA256 over `{timestamp}.{raw body}`. The signature is
+        verified against the **raw** bytes before parsing, with a constant-time
+        compare and a ±300 s timestamp tolerance.
+
+        Delivery is at-least-once and may arrive out of order: `event_id` is the
+        dedupe key and the transition key, so an event is applied at most once.
+        A callback that would move an already-decided application is refused by
+        the transition table and acknowledged with 200 — there is nothing for
+        the provider to retry. `sequence` is recorded for audit only.
+      parameters:
+        - name: X-Provider-Signature
+          in: header
+          required: true
+          schema: { type: string, description: hex HMAC-SHA256 }
+        - name: X-Provider-Timestamp
+          in: header
+          required: true
+          schema: { type: string, description: Unix seconds }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/KycCallback' }
+      responses:
+        '200':
+          description: Accepted, already applied (duplicate), or stale (no state change)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: true }
+        '401':
+          description: Signature invalid, missing, outside tolerance, or the body is unusable
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok: { type: boolean, const: false }
+                  reason:
+                    type: string
+                    enum: [server_misconfigured_no_secret, missing_signature_headers, raw_body_unavailable,
+                           timestamp_outside_tolerance, bad_signature, unparseable_body, incomplete_event]
+
+components:
+  schemas:
+    State:
+      type: string
+      enum: [draft, submitted, screening, kyc_pending, kyc_unknown,
+             kyc_review, approved, rejected, expired, account_opened]
+
+    ApplicationRequest:
+      type: object
+      required: [customer_external_ref, product_code, applicant]
+      properties:
+        customer_external_ref: { type: string, example: CUST-88213 }
+        product_code: { type: string, example: CURRENT_ACCOUNT_EUR }
+        applicant:
+          type: object
+          required: [given_name, family_name, date_of_birth, country]
+          properties:
+            given_name:    { type: string, example: Jonas }
+            family_name:   { type: string, example: Petraitis }
+            date_of_birth: { type: string, format: date, example: "1991-04-17" }
+            country:       { type: string, pattern: '^[A-Z]{2}$', example: LT }
+
+    ApplicationResponse:
+      type: object
+      properties:
+        application_id: { type: string, format: uuid }
+        state: { $ref: '#/components/schemas/State' }
+        version:
+          type: integer
+          description: Present on replays. Increments on every transition.
+
+    KycCallback:
+      type: object
+      required: [event_id, client_reference, decision]
+      properties:
+        event_id:         { type: string, description: Dedupe and transition key. }
+        check_id:         { type: string, description: The provider's id for the check. }
+        client_reference: { type: string, format: uuid, description: Our application id. }
+        sequence:         { type: integer, description: Recorded for audit only. }
+        decision:
+          type: string
+          enum: [CLEAR, REFER, DECLINE]
+          description: >
+            CLEAR → approved · DECLINE → rejected · REFER (or anything unrecognised) → kyc_review.
+            No provider value maps to an automatic reject on a technical failure — that is the point.
