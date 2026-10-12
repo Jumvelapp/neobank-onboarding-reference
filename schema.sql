@@ -56,6 +56,10 @@ create table app.application (
   -- round can no longer decide anything.
   kyc_round             int         not null default 1,
   kyc_attempts          int         not null default 0,
+  -- When the current kyc_pending began. The callback SLA runs from here, so
+  -- re-submits (which renew updated_at as a lease) can never starve it.
+  pending_since         timestamptz,
+  pending_submits       int         not null default 0,   -- capped re-submits per stay
   next_attempt_at       timestamptz,
   submitted_at          timestamptz,
   decided_at            timestamptz,
@@ -331,6 +335,8 @@ begin
          kyc_round       = case when v_new_round then a.kyc_round + 1 else a.kyc_round end,
          kyc_attempts    = case when v_new_round then 0 else a.kyc_attempts end,
          provider_ref    = case when v_new_round then null else a.provider_ref end,
+         pending_since   = case when p_to = 'kyc_pending' then now() else null end,
+         pending_submits = case when p_to = 'kyc_pending' then 0 else a.pending_submits end,
          version         = a.version + 1,
          updated_at      = now(),
          reject_reason   = case when p_to = 'rejected' then p_reason else a.reject_reason end,
@@ -507,11 +513,24 @@ begin
   v_app   := m[1]::uuid;
   v_round := m[2]::int;
 
-  select a.kyc_round into v_cur from app.application a where a.id = v_app;
+  -- Read the round under the row lock, so a review decision starting a new
+  -- round cannot slip in between this check and the transition.
+  select a.kyc_round into v_cur from app.application a where a.id = v_app for update;
   if v_round is not null and v_cur is not null and v_round <> v_cur then
-    -- A decision about an earlier check. It may be genuine; it is not ours.
-    update app.provider_event set result = 'stale_round' where event_id = p_event_id;
-    return query select true, 'stale_round'::text, null::app.application_state;
+    -- A decision about an earlier check: it cannot decide this round. But an
+    -- adverse one (DECLINE, REFER) is a signal about the same person, so it
+    -- goes to a human; an old CLEAR is simply recorded.
+    if p_to in ('rejected', 'kyc_review') then
+      select * into r from app._apply_transition(
+        v_app, null, 'kyc_review', 'system', p_actor_ref,
+        'earlier_round_' || coalesce(nullif(substring(p_reason from 'provider_(.*)'), ''), 'signal'),
+        'event:' || p_event_id);
+      update app.provider_event set result = 'stale_round_escalated:' || r.result where event_id = p_event_id;
+      return query select true, 'stale_round_escalated'::text, r.state;
+    else
+      update app.provider_event set result = 'stale_round' where event_id = p_event_id;
+      return query select true, 'stale_round'::text, null::app.application_state;
+    end if;
     return;
   end if;
 
@@ -540,8 +559,8 @@ declare
 begin
   for r in
     select a.id, a.version from app.application a
-     where a.state = 'kyc_pending' and a.updated_at < now() - p_sla
-     order by a.updated_at
+     where a.state = 'kyc_pending' and a.pending_since < now() - p_sla
+     order by a.pending_since
      limit 100
      for update skip locked
   loop
@@ -571,12 +590,13 @@ as $$
     select id from app.application
      where state = 'kyc_pending' and provider_ref is null
        and updated_at < now() - p_lease
+       and pending_submits < 5          -- then the callback SLA takes over
      order by updated_at
      limit p_limit
      for update skip locked
   )
   update app.application a
-     set updated_at = now()
+     set updated_at = now(), pending_submits = a.pending_submits + 1
     from due d
    where a.id = d.id
   returning a.id, a.version, a.kyc_round;

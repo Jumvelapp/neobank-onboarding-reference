@@ -3,7 +3,7 @@
 A reference implementation, not a client system: the actual artifacts, so you
 can disagree with the decisions.
 
-> **Status.** The database layer and the workflow logic are tested — 52 tests
+> **Status.** The database layer and the workflow logic are tested — 55 tests
 > run the workflow's own SQL and JavaScript against real Postgres 16 (PGlite)
 > with a stubbed screening service and KYC provider (`npm test`). It has **not**
 > been run inside a live n8n instance or against a real KYC or screening
@@ -116,12 +116,15 @@ KYC outcome goes on to KYC instead.
 **7. KYC happens in rounds.**
 One round is one check at the provider: idempotency key `<id>:kyc:<round>`,
 client reference `<id>:<round>`. "More info" (or approving a case that never
-reached KYC) starts a new round — attempts reset, provider reference cleared —
-and a late callback from an earlier round is acknowledged as `stale_round`
-without deciding anything. A scheduled step submits any `kyc_pending`
-application that has no provider reference after a 2-minute lease, which also
-recovers a crash between recording `kyc_pending` and the provider call: same
-round, same key, so the provider de-duplicates. Reconciler transition keys
+reached KYC) starts a new round — attempts reset, provider reference cleared.
+A late callback from an earlier round can never decide the current one: an old
+`CLEAR` is recorded and ignored, but an old `DECLINE` or `REFER` is a signal
+about the same person, so it moves the application to review. A scheduled step
+submits any `kyc_pending` application that has no provider reference after a
+2-minute lease (at most 5 times per stay), which also recovers a crash between
+recording `kyc_pending` and the provider call: same round, same key, so the
+provider de-duplicates. The callback SLA runs from when `kyc_pending` began,
+so those re-submits can never starve it. Reconciler transition keys
 carry the state version, so the same provider answer seen on a later trip is
 applied, not mistaken for a duplicate.
 
@@ -199,7 +202,7 @@ a decline is an audited state, not a lost HTTP error.
 
 ```bash
 npm install
-npm test      # 52 tests, ~70 s — no database server or n8n needed
+npm test      # 55 tests, ~75 s — no database server or n8n needed
 ```
 
 - `schema.test.mjs` — the orchestrator role cannot read or write any table;
@@ -221,7 +224,8 @@ npm test      # 52 tests, ~70 s — no database server or n8n needed
   limit after a crash; callback SLA; KYC rounds — reviewer approval of a
   pre-KYC case submits a new round, "more info" after a REFER or an exhausted
   budget is resubmitted and decided only by its own round, a stale round's
-  callback changes nothing, a crash mid-call is recovered with the same key;
+  CLEAR changes nothing while its DECLINE escalates to review, a crash mid-call
+  is recovered with the same key, re-submits are capped and cannot starve the SLA;
   separate screening and KYC credentials.
 
 `harness.mjs` is a small interpreter for exactly the node types this workflow
