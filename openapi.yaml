@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Neobank onboarding — KYC
-  version: "1.1.0"
+  version: "1.2.0"
   description: |
     Contract for the two webhooks in `workflow.n8n.json`. Paths match the
     workflow exactly (n8n serves them under `/webhook`).
@@ -15,9 +15,13 @@ info:
     applicant behind a key that is already known.
 
     **The decision is asynchronous.** A successful submit returns
-    `kyc_pending`; the provider decides later and calls
+    `in_progress`; the provider decides later and calls
     `/onboarding/kyc-callback`. A timeout on the provider call leads to
-    `kyc_unknown` and reconciliation — never to a decline.
+    reconciliation — never to a decline.
+
+    **Public status only.** Responses never carry internal compliance states
+    (telling an applicant they are in sanctions review is tipping-off):
+    `received | in_progress | approved | declined | expired`.
 
 servers:
   - url: http://localhost:5678/webhook
@@ -28,6 +32,8 @@ paths:
     post:
       summary: Submit an onboarding application (idempotent)
       operationId: submitApplication
+      security:
+        - ClientApiKey: []
       parameters:
         - name: Idempotency-Key
           in: header
@@ -46,10 +52,9 @@ paths:
         '201':
           description: >
             Application created and processed as far as it synchronously can.
-            `state` is where it got to: `kyc_pending` (sent to the provider),
-            `kyc_review` (screening hit or unavailable, or the provider refused
-            the request), `kyc_unknown` (provider call indeterminate), or
-            `rejected` (ineligible — under 18, unsupported country).
+            `status` is `in_progress` while screening, KYC or review is running,
+            or `declined` when the applicant is ineligible (under 18,
+            unsupported country). The reason is not disclosed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/ApplicationResponse' }
@@ -67,6 +72,8 @@ paths:
                 properties:
                   error: { type: string, example: validation_failed }
                   problems: { type: array, items: { type: string } }
+        '401':
+          description: Missing or wrong client API key
         '409':
           description: >
             `idempotency_key_reuse_with_different_payload` — same key, different body.
@@ -81,7 +88,6 @@ paths:
                     type: string
                     enum: [idempotency_key_reuse_with_different_payload, application_already_open]
                   application_id: { type: string, format: uuid }
-                  state: { $ref: '#/components/schemas/State' }
 
   /onboarding/kyc-callback:
     post:
@@ -113,7 +119,7 @@ paths:
             schema: { $ref: '#/components/schemas/KycCallback' }
       responses:
         '200':
-          description: Accepted, already applied (duplicate), or stale (no state change)
+          description: Accepted — applied, duplicate, lifecycle event, unknown reference, or stale (no state change)
           content:
             application/json:
               schema:
@@ -134,11 +140,19 @@ paths:
                            timestamp_outside_tolerance, bad_signature, unparseable_body, incomplete_event]
 
 components:
+  securitySchemes:
+    ClientApiKey:
+      type: apiKey
+      in: header
+      name: X-Api-Key
+
   schemas:
-    State:
+    PublicStatus:
       type: string
-      enum: [draft, submitted, screening, kyc_pending, kyc_unknown,
-             kyc_review, approved, rejected, expired, account_opened]
+      enum: [received, in_progress, approved, declined, expired]
+      description: >
+        Deliberately coarse. Internal states (screening, kyc_pending,
+        kyc_unknown, kyc_review…) all map to in_progress.
 
     ApplicationRequest:
       type: object
@@ -159,22 +173,21 @@ components:
       type: object
       properties:
         application_id: { type: string, format: uuid }
-        state: { $ref: '#/components/schemas/State' }
-        version:
-          type: integer
-          description: Present on replays. Increments on every transition.
+        status: { $ref: '#/components/schemas/PublicStatus' }
 
     KycCallback:
       type: object
-      required: [event_id, client_reference, decision]
+      required: [event_id]
       properties:
         event_id:         { type: string, description: Dedupe and transition key. }
         check_id:         { type: string, description: The provider's id for the check. }
         client_reference: { type: string, format: uuid, description: Our application id. }
         sequence:         { type: integer, description: Recorded for audit only. }
+        event_type:       { type: string, description: 'Lifecycle events (e.g. check.started) are recorded and acknowledged; they never move state.' }
         decision:
           type: string
           enum: [CLEAR, REFER, DECLINE]
           description: >
-            CLEAR → approved · DECLINE → rejected · REFER (or anything unrecognised) → kyc_review.
-            No provider value maps to an automatic reject on a technical failure — that is the point.
+            CLEAR → approved · DECLINE → rejected · REFER → kyc_review. Absent or
+            unrecognised → recorded, no state change. No provider value maps to an
+            automatic reject on a technical failure — that is the point.

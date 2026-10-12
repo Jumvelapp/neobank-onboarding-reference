@@ -75,7 +75,8 @@ test('transitions follow the table; illegal ones are refused, not raised', async
   await move(db, b.application_id, 'screening', 'b1')
   await move(db, b.application_id, 'kyc_review', 'b2')
   assert.equal((await move(db, b.application_id, 'approved', 'b3')).result, 'forbidden')
-  assert.equal((await move(db, b.application_id, 'approved', 'b4', 'reviewer')).result, 'applied')
+  // …and the orchestrator cannot claim to be a reviewer either (decide_review is the only way out).
+  assert.equal((await move(db, b.application_id, 'approved', 'b4', 'reviewer')).result, 'forbidden')
 
   const events = await asAdmin(db, 'select to_state from app.application_event where application_id=$1 order by id', [id])
   assert.deepEqual(events.map((e) => e.to_state), ['submitted', 'screening', 'kyc_pending', 'approved'])
@@ -124,10 +125,79 @@ test('kyc_unknown is scheduled, claimed when due, and backed off', async () => {
   assert.equal(after.next_attempt_at, null)
 })
 
-test('provider events are de-duplicated atomically', async () => {
+
+// ---------------------------------------------------------------- review 2026-10-12 (architect findings)
+const asReviewer = async (db, sql, params = []) => {
+  await db.exec('set role review_app')
+  try { return (await db.query(sql, params)).rows } finally { await db.exec('reset role') }
+}
+async function inReview(db, ref = 'RV') {
+  const { application_id: id } = await submit(db, `k-${ref}`, 'fp', ref)
+  await move(db, id, 'screening', 's')
+  await move(db, id, 'kyc_review', 'r')
+  const [task] = await asAdmin(db, 'select id from app.review_task where application_id=$1 and checker_at is null', [id])
+  return { id, task: task.id }
+}
+
+test('maker-checker: the orchestrator cannot act as a reviewer', async () => {
   const db = await freshDb()
-  const rec = () => asService(db, 'select * from app.record_provider_event($1,$2,$3,$4::bigint,$5::jsonb)',
-    ['evt-1', 'chk-1', 'CLEAR', null, '{}']).then((r) => r[0].is_new)
-  assert.equal(await rec(), true)
-  assert.equal(await rec(), false)
+  const { id } = await inReview(db)
+  const r = await move(db, id, 'approved', 'bypass', 'reviewer')
+  assert.equal(r.result, 'forbidden')
+  assert.equal((await asAdmin(db, 'select state from app.application where id=$1', [id]))[0].state, 'kyc_review')
+  await assert.rejects(asService(db, "select * from app.decide_review(gen_random_uuid(), 'x')"), /permission denied/)
+})
+
+test('maker-checker: the same person cannot propose and decide; two people can', async () => {
+  const db = await freshDb()
+  const { id, task } = await inReview(db)
+  await asReviewer(db, "select * from app.propose_review($1, 'alice', 'approve', 'docs ok')", [task])
+  const same = (await asReviewer(db, "select * from app.decide_review($1, 'alice')", [task]))[0]
+  assert.equal(same.result, 'forbidden')
+  const ok = (await asReviewer(db, "select * from app.decide_review($1, 'bob')", [task]))[0]
+  assert.deepEqual([ok.result, ok.state], ['applied', 'approved'])
+  const [t] = await asAdmin(db, 'select maker_id, checker_id, checker_at from app.review_task where id=$1', [task])
+  assert.deepEqual([t.maker_id, t.checker_id, Boolean(t.checker_at)], ['alice', 'bob', true])
+})
+
+test('maker-checker: no decision without a proposal; a checker without a maker is rejected by the table', async () => {
+  const db = await freshDb()
+  const { id, task } = await inReview(db)
+  assert.equal((await asReviewer(db, "select * from app.decide_review($1, 'bob')", [task]))[0].result, 'forbidden')
+  await assert.rejects(
+    asAdmin(db, "insert into app.review_task(application_id,raised_reason,checker_id,checker_at) values($1,'x','bob',now())", [id]),
+    /review_four_eyes|review_task_open_uq|duplicate key/)
+})
+
+test('a second trip into review opens a new task once the first is decided', async () => {
+  const db = await freshDb()
+  const { id, task } = await inReview(db)
+  await asReviewer(db, "select * from app.propose_review($1, 'alice', 'request_more_info', 'need proof of address')", [task])
+  assert.equal((await asReviewer(db, "select * from app.decide_review($1, 'bob')", [task]))[0].state, 'kyc_pending')
+  await move(db, id, 'kyc_review', 'again')
+  const tasks = await asAdmin(db, 'select checker_at from app.review_task where application_id=$1 order by created_at', [id])
+  assert.equal(tasks.length, 2)
+  assert.equal(tasks.filter((t) => !t.checker_at).length, 1)
+})
+
+test('a transition key reused for a different target is a conflict, not a duplicate', async () => {
+  const db = await freshDb()
+  const { application_id: id } = await submit(db, 'k1')
+  await move(db, id, 'screening', 'K1')
+  assert.equal((await move(db, id, 'rejected', 'K1')).result, 'key_conflict')
+  assert.equal((await move(db, id, 'screening', 'K1')).result, 'duplicate')
+})
+
+test('provider event: recorded and applied in one call; lifecycle events and unknown references are acknowledged', async () => {
+  const db = await freshDb()
+  const { application_id: id } = await submit(db, 'k1')
+  await move(db, id, 'screening', 's')
+  await move(db, id, 'kyc_pending', 'p')
+  const apply = (evt, ref, to) => asService(db,
+    'select * from app.apply_provider_event($1,$2,$3,$4::bigint,$5::jsonb,$6,$7::app.application_state,$8,$9)',
+    [evt, 'chk', 'x', null, '{}', ref, to, 'r', 'exec']).then((r) => r[0])
+  assert.deepEqual(Object.values(await apply('e1', id, 'approved')).slice(0, 2), [true, 'applied'])
+  assert.deepEqual(Object.values(await apply('e1', id, 'approved')).slice(0, 2), [false, 'duplicate'])
+  assert.equal((await apply('e2', id, null)).result, 'ignored')
+  assert.equal((await apply('e3', 'not-a-uuid', 'approved')).result, 'not_found')
 })

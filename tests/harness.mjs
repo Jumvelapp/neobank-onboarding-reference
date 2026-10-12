@@ -129,7 +129,16 @@ export async function run(start, startItems, { db, http = {}, env = {}, executio
             body: p.jsonBody ? JSON.parse(evaluate(p.jsonBody, it, input)) : undefined,
           }
           calls.push({ node: name, ...req })
-          const res = await stub(req)
+          let res
+          try {
+            res = await stub(req)
+          } catch (err) {
+            // n8n: a thrown error (timeout, reset) stops the execution unless the
+            // node continues on error, in which case the item carries json.error.
+            if (n.onError !== 'continueRegularOutput') throw err
+            out.push(withLineage(name, { error: { message: err.message } }, it))
+            continue
+          }
           out.push(withLineage(name, { statusCode: res.statusCode, body: res.body ?? null, headers: {} }, it))
         }
         outputs = [out]

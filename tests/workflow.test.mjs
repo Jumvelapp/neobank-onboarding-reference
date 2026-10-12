@@ -59,8 +59,9 @@ test('happy path: submit → screened → sent to KYC → signed CLEAR → appro
   const db = await freshDb()
   const { response, calls } = await submit(db, { customer_external_ref: 'CUST-1', product_code: 'CURRENT_ACCOUNT_EUR', applicant: applicant() })
   assert.equal(response.status, 201)
-  assert.equal(response.body.state, 'kyc_pending')
+  assert.equal(response.body.status, 'in_progress')
   const id = response.body.application_id
+  assert.equal((await appRow(db, id)).state, 'kyc_pending')
 
   const kyc = calls.find((c) => c.node === 'Submit to KYC provider')
   assert.equal(kyc.headers['Idempotency-Key'], `${id}:kyc`)
@@ -122,7 +123,7 @@ test('ineligible applicant → audited rejection, no screening or KYC call', asy
   const db = await freshDb()
   const { response, calls } = await submit(db, { customer_external_ref: 'CUST-7', product_code: 'P', applicant: applicant({ date_of_birth: '2015-01-01' }) })
   assert.equal(response.status, 201)
-  assert.equal(response.body.state, 'rejected')
+  assert.equal(response.body.status, 'declined')
   assert.equal((await appRow(db, response.body.application_id)).reject_reason, 'under_18')
   assert.equal(calls.length, 0)
 })
@@ -131,7 +132,7 @@ test('sanctions hit → human review, and the KYC provider is never called', asy
   const db = await freshDb()
   const { response, calls } = await submit(db, { customer_external_ref: 'CUST-8', product_code: 'P', applicant: applicant() },
     { http: { 'Sanctions / PEP screening': () => ({ statusCode: 200, body: { matches: [{ list: 'EU' }] } }) } })
-  assert.equal(response.body.state, 'kyc_review')
+  assert.equal((await appRow(db, response.body.application_id)).state, 'kyc_review')
   assert.ok(!calls.some((c) => c.node === 'Submit to KYC provider'))
   const tasks = await asAdmin(db, 'select raised_reason from app.review_task where application_id=$1', [response.body.application_id])
   assert.deepEqual(tasks.map((t) => t.raised_reason), ['sanctions_hit'])
@@ -141,15 +142,15 @@ test('screening unavailable is not a rejection → review', async () => {
   const db = await freshDb()
   const { response } = await submit(db, { customer_external_ref: 'CUST-9', product_code: 'P', applicant: applicant() },
     { http: { 'Sanctions / PEP screening': () => ({ statusCode: 503 }) } })
-  assert.equal(response.body.state, 'kyc_review')
+  assert.equal((await appRow(db, response.body.application_id)).state, 'kyc_review')
 })
 
 test('provider timeout → kyc_unknown (never rejected), scheduled for reconciliation', async () => {
   const db = await freshDb()
   const { response } = await submit(db, { customer_external_ref: 'CUST-10', product_code: 'P', applicant: applicant() },
     { http: { 'Submit to KYC provider': () => ({ statusCode: 0 }) } })
-  assert.equal(response.body.state, 'kyc_unknown')
   const row = await appRow(db, response.body.application_id)
+  assert.equal(row.state, 'kyc_unknown')
   assert.ok(row.next_attempt_at)
   assert.equal(row.reject_reason, null)
 })
@@ -277,7 +278,7 @@ test('reconcile: no callback within the SLA → kyc_unknown, then the provider i
   const db = await freshDb()
   const { response } = await submit(db, { customer_external_ref: 'R-6', product_code: 'P', applicant: applicant() })
   const id = response.body.application_id
-  assert.equal(response.body.state, 'kyc_pending')
+  assert.equal((await appRow(db, id)).state, 'kyc_pending')
   await asAdmin(db, "update app.application set updated_at = now() - interval '7 hours' where id=$1", [id])
 
   const http = { 'Query provider by our ref': () => ({ statusCode: 200, body: { data: [{ id: 'chk-1', status: 'complete', result: 'CLEAR' }] } }) }
@@ -294,4 +295,84 @@ test('reconcile: an application still inside the SLA is left alone', async () =>
   const { response } = await submit(db, { customer_external_ref: 'R-7', product_code: 'P', applicant: applicant() })
   await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: {} })
   assert.equal((await appRow(db, response.body.application_id)).state, 'kyc_pending')
+})
+
+// ---------------------------------------------------------------- review 2026-10-12 (architect findings)
+const timeout = () => { throw new Error('ETIMEDOUT') }
+
+test('structure: every HTTP node continues on error, so a timeout reaches the classifier', () => {
+  for (const n of workflow.nodes.filter((x) => x.type === 'n8n-nodes-base.httpRequest')) {
+    assert.equal(n.onError, 'continueRegularOutput', n.name)
+  }
+})
+
+test('structure: the submit webhook requires authentication', () => {
+  const wh = workflow.nodes.find((n) => n.name === 'Webhook: Submit application')
+  assert.equal(wh.parameters.authentication, 'headerAuth')
+})
+
+test('a real timeout (thrown, not a status code) → kyc_unknown', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'T-1', product_code: 'P', applicant: applicant() },
+    { http: { 'Submit to KYC provider': timeout } })
+  const id = response.body.application_id
+  assert.equal((await appRow(db, id)).state, 'kyc_unknown')
+})
+
+test('screening timeout → review, never a decision', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'T-2', product_code: 'P', applicant: applicant() },
+    { http: { 'Sanctions / PEP screening': timeout } })
+  assert.equal((await appRow(db, response.body.application_id)).state, 'kyc_review')
+})
+
+test('responses never expose internal compliance states (no tipping-off)', async () => {
+  const db = await freshDb()
+  const hit = await submit(db, { customer_external_ref: 'T-3', product_code: 'P', applicant: applicant() },
+    { http: { 'Sanctions / PEP screening': () => ({ statusCode: 200, body: { matches: [{ list: 'EU' }] } }) } })
+  assert.equal(hit.response.body.state, undefined)
+  assert.equal(hit.response.body.status, 'in_progress')
+  const replay = await submit(db, { customer_external_ref: 'T-3', product_code: 'P', applicant: applicant() })
+  assert.equal(replay.response.body.status, 'in_progress')
+  assert.ok(!JSON.stringify(replay.response.body).includes('kyc_'))
+})
+
+test('reconcile: still processing on the last attempt → review, not stuck', async () => {
+  const db = await freshDb()
+  const id = await unknownApp(db, 'T-4')
+  await asAdmin(db, "update app.application set kyc_attempts = 7, next_attempt_at = now() - interval '1 second' where id=$1", [id])
+  await run('Every 5 min: reconcile', [{ json: {} }], {
+    db, env, http: { 'Query provider by our ref': () => ({ statusCode: 200, body: { data: [{ id: 'c', status: 'processing' }] } }) },
+  })
+  assert.equal((await appRow(db, id)).state, 'kyc_review')
+})
+
+test('reconcile: an application left at the attempt limit (e.g. after a crash) is still claimed and reviewed', async () => {
+  const db = await freshDb()
+  const id = await unknownApp(db, 'T-5')
+  await asAdmin(db, "update app.application set kyc_attempts = 8, next_attempt_at = now() - interval '1 second' where id=$1", [id])
+  await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: { 'Query provider by our ref': timeout } })
+  assert.equal((await appRow(db, id)).state, 'kyc_review')
+})
+
+test('callback: a lifecycle event without a decision is acknowledged and changes nothing', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'T-6', product_code: 'P', applicant: applicant() })
+  const id = response.body.application_id
+  const cb = await callback(db, signed({ event_id: 'evt-started', check_id: 'chk-1', client_reference: id, event_type: 'check.started' }))
+  assert.equal(cb.response.status, 200)
+  assert.equal((await appRow(db, id)).state, 'kyc_pending')
+  assert.equal((await asAdmin(db, 'select count(*)::int n from app.review_task where application_id=$1', [id]))[0].n, 0)
+})
+
+test('callback: an unusable client_reference is acknowledged, not crashed on', async () => {
+  const db = await freshDb()
+  const cb = await callback(db, signed({ event_id: 'evt-bad', check_id: 'c', client_reference: 'not-a-uuid', decision: 'CLEAR' }))
+  assert.equal(cb.response.status, 200)
+})
+
+test('structure: the callback records and applies the event in one database call', () => {
+  const pgNames = workflow.nodes.filter((n) => n.type === 'n8n-nodes-base.postgres').map((n) => n.parameters.query)
+  assert.ok(pgNames.some((q) => /app\.apply_provider_event\(/.test(q)))
+  assert.ok(!pgNames.some((q) => /app\.record_provider_event\(/.test(q)), 'no separate "seen" step before applying')
 })

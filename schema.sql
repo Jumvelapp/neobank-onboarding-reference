@@ -150,7 +150,8 @@ create table app.review_task (
   checker_id      text,                     -- approves — must differ from maker
   checker_at      timestamptz,
   created_at      timestamptz not null default now(),
-  constraint review_four_eyes check (checker_id is null or checker_id <> maker_id)
+  -- A decision needs a proposal first, and the checker can never be the maker.
+  constraint review_four_eyes check (checker_id is null or (maker_id is not null and checker_id <> maker_id))
 );
 
 create unique index review_task_open_uq
@@ -167,6 +168,8 @@ create table app.provider_event (
   sequence_no  bigint,                      -- recorded for audit; ordering safety
                                             -- comes from the transition table
   payload      jsonb       not null,
+  client_reference text,                    -- as sent; may not be a valid application id
+  result       text,                        -- applied | duplicate | forbidden | ignored | not_found | key_conflict
   received_at  timestamptz not null default now()
 );
 
@@ -233,17 +236,21 @@ end;
 $$;
 
 -- ---------------------------------------------------------------------------
--- THE transition function. Locks first, checks the table, writes state +
--- audit in ONE transaction, and is idempotent on replay.
+-- THE transition. Locks first, checks the table, writes state + audit in ONE
+-- transaction, and is idempotent on the transition key.
 --
--- Returns: applied | duplicate | forbidden | not_found — never raises for
--- business cases; an exception would roll back the caller's own bookkeeping.
+-- Returns: applied | duplicate | forbidden | not_found | key_conflict — never
+-- raises for business cases; an exception would roll back the caller's own
+-- bookkeeping.
 --
 -- Side effects that must never be forgotten by a workflow branch live here:
 --   * entering kyc_unknown schedules the reconciler
 --   * entering kyc_review opens exactly one review task
+--
+-- _apply_transition is internal (no grants). Callers go through
+-- transition_application (system actor only) or decide_review (reviewers).
 -- ---------------------------------------------------------------------------
-create or replace function app.transition_application(
+create or replace function app._apply_transition(
   p_application_id  uuid,
   p_expected_from   app.application_state,   -- null = don't care
   p_to              app.application_state,
@@ -261,21 +268,10 @@ declare
   v_current app.application_state;
   v_version bigint;
   v_allowed boolean;
+  v_prior   app.application_event%rowtype;
 begin
-  -- 1. Replay check BEFORE locking: the cheapest path is the repeated one.
-  select ae.version_after into v_version
-    from app.application_event ae
-   where ae.application_id = p_application_id
-     and ae.idempotency_key = p_idempotency_key;
-
-  if found then
-    select a.state into v_current
-      from app.application a where a.id = p_application_id;
-    return query select 'duplicate'::text, v_current, v_version;
-    return;
-  end if;
-
-  -- 2. Lock the row. Everything after this is serialised per application.
+  -- 1. Lock the row. Everything after this is serialised per application, so
+  --    two concurrent calls with the same key resolve to applied + duplicate.
   select a.state, a.version into v_current, v_version
     from app.application a
    where a.id = p_application_id
@@ -283,6 +279,22 @@ begin
 
   if not found then
     return query select 'not_found'::text, null::app.application_state, null::bigint;
+    return;
+  end if;
+
+  -- 2. Replay check: the same key is a no-op only if it asked for the same
+  --    thing. The same key for a different target is a caller bug.
+  select ae.* into v_prior
+    from app.application_event ae
+   where ae.application_id = p_application_id
+     and ae.idempotency_key = p_idempotency_key;
+
+  if found then
+    if v_prior.to_state = p_to then
+      return query select 'duplicate'::text, v_current, v_prior.version_after;
+    else
+      return query select 'key_conflict'::text, v_current, v_version;
+    end if;
     return;
   end if;
 
@@ -336,8 +348,87 @@ begin
 end;
 $$;
 
+-- The orchestrator's entry point. It may only act as 'system': passing
+-- 'reviewer' is refused, so a workflow can never approve its own review case.
+create or replace function app.transition_application(
+  p_application_id  uuid,
+  p_expected_from   app.application_state,
+  p_to              app.application_state,
+  p_actor           text,
+  p_actor_ref       text,
+  p_reason          text,
+  p_idempotency_key text,
+  p_payload         jsonb default '{}'::jsonb
+) returns table (result text, state app.application_state, version bigint)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  if p_actor is distinct from 'system' then
+    return query select 'forbidden'::text, null::app.application_state, null::bigint;
+    return;
+  end if;
+  return query select * from app._apply_transition(p_application_id, p_expected_from, p_to,
+                                                   'system', p_actor_ref, p_reason,
+                                                   p_idempotency_key, p_payload);
+end;
+$$;
+
 -- ---------------------------------------------------------------------------
--- Provider bookkeeping. Neither changes state.
+-- Maker–checker. Two people, two calls, two roles' worth of separation:
+-- only review_app may call these, and the orchestrator has neither.
+-- ---------------------------------------------------------------------------
+create or replace function app.propose_review(
+  p_task_id uuid, p_maker_id text, p_outcome app.review_outcome, p_note text
+) returns table (result text)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+begin
+  update app.review_task t
+     set maker_id = p_maker_id, maker_outcome = p_outcome, maker_note = p_note
+   where t.id = p_task_id and t.checker_at is null and t.maker_id is null
+     and nullif(trim(p_maker_id), '') is not null;
+  return query select case when found then 'proposed' else 'forbidden' end;
+end;
+$$;
+
+create or replace function app.decide_review(p_task_id uuid, p_checker_id text)
+returns table (result text, state app.application_state)
+language plpgsql
+security definer
+set search_path = ''
+as $$
+declare
+  t  app.review_task%rowtype;
+  r  record;
+begin
+  select * into t from app.review_task where id = p_task_id for update;
+  if not found or t.checker_at is not null or t.maker_id is null
+     or nullif(trim(p_checker_id), '') is null or p_checker_id = t.maker_id then
+    return query select 'forbidden'::text, null::app.application_state;
+    return;
+  end if;
+
+  select * into r from app._apply_transition(
+    t.application_id, 'kyc_review',
+    case t.maker_outcome when 'approve' then 'approved'
+                         when 'reject'  then 'rejected'
+                         else 'kyc_pending' end::app.application_state,
+    'reviewer', 'maker:' || t.maker_id || ' checker:' || p_checker_id,
+    coalesce(t.maker_note, t.maker_outcome::text), 'review:' || t.id);
+
+  if r.result = 'applied' then
+    update app.review_task set checker_id = p_checker_id, checker_at = now() where id = t.id;
+  end if;
+  return query select r.result, r.state;
+end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Provider bookkeeping.
 -- ---------------------------------------------------------------------------
 create or replace function app.record_provider_ref(p_application_id uuid, p_provider_ref text)
 returns table (state app.application_state, version bigint)
@@ -351,21 +442,51 @@ as $$
   returning a.state, a.version;
 $$;
 
--- At-least-once delivery: the same event WILL arrive twice.
--- Returns is_new = false for a duplicate, atomically.
-create or replace function app.record_provider_event(
-  p_event_id text, p_provider_ref text, p_event_type text,
-  p_sequence_no bigint, p_payload jsonb
-) returns table (is_new boolean)
+-- A provider callback, recorded AND applied in one transaction. If applying
+-- fails, the event is not recorded either, so the provider's redelivery is
+-- processed instead of being dropped as "already seen". A duplicate event is
+-- acknowledged without touching state.
+create or replace function app.apply_provider_event(
+  p_event_id text, p_provider_ref text, p_event_type text, p_sequence_no bigint,
+  p_payload jsonb, p_client_reference text,
+  p_to app.application_state,                 -- null = no decision in this event
+  p_reason text, p_actor_ref text
+) returns table (is_new boolean, result text, state app.application_state)
 language plpgsql
 security definer
 set search_path = ''
 as $$
+declare
+  v_app uuid;
+  r     record;
 begin
-  insert into app.provider_event (event_id, provider_ref, event_type, sequence_no, payload)
-  values (p_event_id, p_provider_ref, p_event_type, p_sequence_no, p_payload)
+  insert into app.provider_event (event_id, provider_ref, event_type, sequence_no, payload, client_reference)
+  values (p_event_id, coalesce(p_provider_ref, ''), coalesce(p_event_type, ''), p_sequence_no,
+          coalesce(p_payload, '{}'::jsonb), p_client_reference)
   on conflict (event_id) do nothing;
-  return query select found;
+
+  if not found then
+    return query select false, 'duplicate'::text, null::app.application_state;
+    return;
+  end if;
+
+  if p_to is null then
+    update app.provider_event set result = 'ignored' where event_id = p_event_id;
+    return query select true, 'ignored'::text, null::app.application_state;
+    return;
+  end if;
+
+  if p_client_reference !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+    update app.provider_event set result = 'not_found' where event_id = p_event_id;
+    return query select true, 'not_found'::text, null::app.application_state;
+    return;
+  end if;
+  v_app := p_client_reference::uuid;
+
+  select * into r from app._apply_transition(v_app, null, p_to, 'system', p_actor_ref,
+                                             p_reason, 'event:' || p_event_id);
+  update app.provider_event set result = r.result where event_id = p_event_id;
+  return query select true, r.result, r.state;
 end;
 $$;
 
@@ -412,8 +533,8 @@ as $$
   with claimed as (
     select id from app.application
      where state = 'kyc_unknown'
-       and next_attempt_at <= now()
-       and kyc_attempts < 8
+       and next_attempt_at <= now()     -- no attempt filter: the reconciler decides
+                                        -- when the budget is spent, so nothing is orphaned
      order by next_attempt_at
      limit p_limit
      for update skip locked
@@ -432,22 +553,33 @@ as $$
 $$;
 
 -- ---------------------------------------------------------------------------
--- Least privilege: the orchestrator gets the functions, not the tables.
+-- Least privilege. Two roles, no table rights for either:
+--   service_role — the orchestrator: system transitions and bookkeeping
+--   review_app   — the review tool: propose and decide, nothing else
 -- ---------------------------------------------------------------------------
 do $$ begin
   if not exists (select 1 from pg_roles where rolname = 'service_role') then
     create role service_role nologin;
   end if;
+  if not exists (select 1 from pg_roles where rolname = 'review_app') then
+    create role review_app nologin;
+  end if;
 end $$;
 
 revoke all on schema app from public;
 revoke all on all functions in schema app from public;
-grant usage on schema app to service_role;
+grant usage on schema app to service_role, review_app;
+
 grant execute on function app.submit_application(text, text, jsonb, text, text) to service_role;
 grant execute on function app.transition_application(
   uuid, app.application_state, app.application_state, text, text, text, text, jsonb
 ) to service_role;
 grant execute on function app.record_provider_ref(uuid, text) to service_role;
-grant execute on function app.record_provider_event(text, text, text, bigint, jsonb) to service_role;
+grant execute on function app.apply_provider_event(
+  text, text, text, bigint, jsonb, text, app.application_state, text, text
+) to service_role;
 grant execute on function app.claim_unknown_applications(int) to service_role;
 grant execute on function app.flag_overdue_pending(interval) to service_role;
+
+grant execute on function app.propose_review(uuid, text, app.review_outcome, text) to review_app;
+grant execute on function app.decide_review(uuid, text) to review_app;

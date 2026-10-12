@@ -20,6 +20,10 @@
     {
       "key": "idemKey",
       "value": ""
+    },
+    {
+      "key": "apiKey",
+      "value": "replace-me"
     }
   ],
   "item": [
@@ -45,8 +49,10 @@
               "const b = pm.response.json();",
               "pm.collectionVariables.set('applicationId', b.application_id);",
               "pm.test('has application id', () => pm.expect(b.application_id).to.be.a('string'));",
-              "pm.test('no KYC decision taken synchronously', () =>",
-              "  pm.expect(['kyc_pending','kyc_review','kyc_unknown']).to.include(b.state));"
+              "pm.test('public status only — no internal compliance state', () => {",
+              "  pm.expect(b).to.not.have.property('state');",
+              "  pm.expect(['in_progress','declined']).to.include(b.status);",
+              "});"
             ]
           }
         }
@@ -61,6 +67,10 @@
           {
             "key": "Idempotency-Key",
             "value": "{{idemKey}}"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{apiKey}}"
           }
         ],
         "body": {
@@ -104,6 +114,10 @@
           {
             "key": "Idempotency-Key",
             "value": "{{idemKey}}"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{apiKey}}"
           }
         ],
         "body": {
@@ -148,6 +162,10 @@
           {
             "key": "Idempotency-Key",
             "value": "{{idemKey}}"
+          },
+          {
+            "key": "X-Api-Key",
+            "value": "{{apiKey}}"
           }
         ],
         "body": {

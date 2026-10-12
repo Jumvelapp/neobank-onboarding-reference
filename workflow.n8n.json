@@ -5,6 +5,7 @@
       "parameters": {
         "httpMethod": "POST",
         "path": "onboarding/applications",
+        "authentication": "headerAuth",
         "responseMode": "responseNode",
         "options": {}
       },
@@ -16,7 +17,13 @@
         -900,
         0
       ],
-      "webhookId": "a1f0c9d2-0001-4a10-9f01-000000000001"
+      "webhookId": "a1f0c9d2-0001-4a10-9f01-000000000001",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "Client API key (X-Api-Key)"
+        }
+      }
     },
     {
       "parameters": {
@@ -222,6 +229,7 @@
         860,
         -160
       ],
+      "onError": "continueRegularOutput",
       "retryOnFail": true,
       "maxTries": 3,
       "waitBetweenTries": 2000,
@@ -336,6 +344,7 @@
         1740,
         -320
       ],
+      "onError": "continueRegularOutput",
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 3000,
@@ -439,7 +448,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// One place that turns what happened into an HTTP answer.\nconst resolved = $('Resolve idempotency').first().json;\nif (resolved._halt) {\n  return [{ json: { http_status: resolved.status,\n                    response: { error: resolved.error, problems: resolved.problems } } }];\n}\n\nconst sub = $('PG: submit application').first().json;\nconst latest = $input.first().json;           // output of the last step that ran\n\nswitch (sub.outcome) {\n  case 'key_conflict':\n    return [{ json: { http_status: 409, response: {\n      error: 'idempotency_key_reuse_with_different_payload', application_id: sub.application_id } } }];\n  case 'already_open':\n    return [{ json: { http_status: 409, response: {\n      error: 'application_already_open', application_id: sub.application_id, state: sub.state } } }];\n  case 'replay':\n    // Return current state; never restart the process.\n    return [{ json: { http_status: 200, response: {\n      application_id: sub.application_id, state: sub.state, version: Number(sub.version) } } }];\n  default:\n    return [{ json: { http_status: 201, response: {\n      application_id: sub.application_id, state: latest.state ?? sub.state } } }];\n}\n"
+        "jsCode": "// One place that turns what happened into an HTTP answer. Internal states\n// never leave the bank: telling an applicant \"kyc_review\" after a sanctions\n// hit is tipping-off. The client sees a coarse public status.\nconst PUBLIC = {\n  draft: 'received', submitted: 'received',\n  screening: 'in_progress', kyc_pending: 'in_progress', kyc_unknown: 'in_progress', kyc_review: 'in_progress',\n  approved: 'approved', account_opened: 'approved', rejected: 'declined', expired: 'expired',\n};\nconst resolved = $('Resolve idempotency').first().json;\nif (resolved._halt) {\n  return [{ json: { http_status: resolved.status,\n                    response: { error: resolved.error, problems: resolved.problems } } }];\n}\n\nconst sub = $('PG: submit application').first().json;\nconst latest = $input.first().json;           // output of the last step that ran\n\nswitch (sub.outcome) {\n  case 'key_conflict':\n    return [{ json: { http_status: 409, response: {\n      error: 'idempotency_key_reuse_with_different_payload', application_id: sub.application_id } } }];\n  case 'already_open':\n    return [{ json: { http_status: 409, response: {\n      error: 'application_already_open', application_id: sub.application_id } } }];\n  case 'replay':\n    // Return current state; never restart the process.\n    return [{ json: { http_status: 200, response: {\n      application_id: sub.application_id, status: PUBLIC[sub.state] } } }];\n  default:\n    return [{ json: { http_status: 201, response: {\n      application_id: sub.application_id, status: PUBLIC[latest.state ?? sub.state] } } }];\n}\n"
       },
       "id": "8f03340b-1f76-5d79-81e0-b040a3ef75b7",
       "name": "Shape response",
@@ -488,7 +497,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// ---------------------------------------------------------------\n// Inbound webhook hardening. Four separate concerns, all mandatory:\n//\n//  1. Verify HMAC over the RAW bytes, BEFORE parsing. With rawBody on, n8n\n//     keeps the exact bytes as binary 'data'; json.body is already a parse.\n//     Re-serialising a parse changes bytes and the signature never matches\n//     — and \"fixing\" that by trusting the parse means no signature check.\n//  2. Constant-time compare. A fast-fail === leaks the signature by timing.\n//  3. Timestamp tolerance. Without it a captured payload replays forever.\n//  4. Only THEN look at the contents.\n// ---------------------------------------------------------------\nconst crypto = require('crypto');   // needs NODE_FUNCTION_ALLOW_BUILTIN=crypto\n\nconst item    = $input.first();\nconst headers = item.json.headers ?? {};\nconst reject  = (reason) => [{ json: { _ok: false, status: 401, reason } }];\n\nconst secret    = $env.KYC_WEBHOOK_SECRET;\nconst signature = String(headers['x-provider-signature'] ?? '');\nconst timestamp = String(headers['x-provider-timestamp'] ?? '');\n\nif (!secret)                  return reject('server_misconfigured_no_secret');\nif (!signature || !timestamp) return reject('missing_signature_headers');\nif (!item.binary?.data)       return reject('raw_body_unavailable');\n\n// 3. Replay window — five minutes either side of now.\nconst skew = Math.abs(Date.now() / 1000 - Number(timestamp));\nif (!Number.isFinite(skew) || skew > 300) return reject('timestamp_outside_tolerance');\n\n// 1. Sign exactly what was sent: timestamp + '.' + raw bytes.\nconst raw      = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst expected = crypto.createHmac('sha256', secret)\n                       .update(Buffer.concat([Buffer.from(`${timestamp}.`), raw]))\n                       .digest('hex');\n\n// 2. Constant-time. Lengths must match first or timingSafeEqual throws.\nconst a = Buffer.from(expected, 'utf8');\nconst b = Buffer.from(signature, 'utf8');\nif (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return reject('bad_signature');\n\n// 4. Trusted from here on.\nlet payload;\ntry { payload = JSON.parse(raw.toString('utf8')); }\ncatch { return reject('unparseable_body'); }\nif (!payload.event_id || !payload.client_reference) return reject('incomplete_event');\n\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\n\nreturn [{ json: {\n  _ok: true,\n  event_id:       String(payload.event_id),\n  provider_ref:   String(payload.check_id ?? ''),\n  application_id: payload.client_reference,\n  sequence_no:    payload.sequence ?? null,\n  decision:       payload.decision,\n  next:           decisionMap[payload.decision] ?? 'kyc_review',\n  reason:         `provider_${payload.decision ?? 'UNKNOWN'}`,\n  // Transition idempotency key = the provider's event id: replaying the\n  // same event can never produce a second transition.\n  tkey:           `event:${payload.event_id}`,\n  payload\n} }];\n"
+        "jsCode": "// ---------------------------------------------------------------\n// Inbound webhook hardening. Four separate concerns, all mandatory:\n//\n//  1. Verify HMAC over the RAW bytes, BEFORE parsing. With rawBody on, n8n\n//     keeps the exact bytes as binary 'data'; json.body is already a parse.\n//     Re-serialising a parse changes bytes and the signature never matches\n//     — and \"fixing\" that by trusting the parse means no signature check.\n//  2. Constant-time compare. A fast-fail === leaks the signature by timing.\n//  3. Timestamp tolerance. Without it a captured payload replays forever.\n//  4. Only THEN look at the contents.\n// ---------------------------------------------------------------\nconst crypto = require('crypto');   // needs NODE_FUNCTION_ALLOW_BUILTIN=crypto\n\nconst item    = $input.first();\nconst headers = item.json.headers ?? {};\nconst reject  = (reason) => [{ json: { _ok: false, status: 401, reason } }];\n\nconst secret    = $env.KYC_WEBHOOK_SECRET;\nconst signature = String(headers['x-provider-signature'] ?? '');\nconst timestamp = String(headers['x-provider-timestamp'] ?? '');\n\nif (!secret)                  return reject('server_misconfigured_no_secret');\nif (!signature || !timestamp) return reject('missing_signature_headers');\nif (!item.binary?.data)       return reject('raw_body_unavailable');\n\n// 3. Replay window — five minutes either side of now.\nconst skew = Math.abs(Date.now() / 1000 - Number(timestamp));\nif (!Number.isFinite(skew) || skew > 300) return reject('timestamp_outside_tolerance');\n\n// 1. Sign exactly what was sent: timestamp + '.' + raw bytes.\nconst raw      = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst expected = crypto.createHmac('sha256', secret)\n                       .update(Buffer.concat([Buffer.from(`${timestamp}.`), raw]))\n                       .digest('hex');\n\n// 2. Constant-time. Lengths must match first or timingSafeEqual throws.\nconst a = Buffer.from(expected, 'utf8');\nconst b = Buffer.from(signature, 'utf8');\nif (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return reject('bad_signature');\n\n// 4. Trusted from here on.\nlet payload;\ntry { payload = JSON.parse(raw.toString('utf8')); }\ncatch { return reject('unparseable_body'); }\nif (!payload.event_id) return reject('incomplete_event');\n\n// Only an actual decision moves state. Lifecycle events (check.started,\n// document.uploaded…) are recorded and acknowledged — a provider sends many.\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\n\nreturn [{ json: {\n  _ok: true,\n  event_id:       String(payload.event_id),\n  provider_ref:   String(payload.check_id ?? ''),\n  client_reference: String(payload.client_reference ?? ''),\n  sequence_no:    payload.sequence ?? null,\n  event_type:     String(payload.event_type ?? payload.decision ?? ''),\n  next:           decisionMap[payload.decision] ?? null,\n  reason:         `provider_${payload.decision ?? payload.event_type ?? 'event'}`,\n  payload\n} }];\n"
       },
       "id": "49927291-3964-5a9d-9463-eb355766906f",
       "name": "Verify HMAC (raw body)",
@@ -534,86 +543,18 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- At-least-once delivery: the same event WILL arrive twice.\n-- is_new answers \"have we seen this?\" atomically.\nselect * from app.record_provider_event($1, $2, $3, $4::bigint, $5::jsonb);",
+        "query": "-- Record AND apply in one transaction (keyed on the provider's event_id).\n-- If applying fails, nothing is recorded, so the redelivery is processed\n-- instead of being dropped as \"already seen\". Duplicates, lifecycle events,\n-- unknown references and stale decisions are all acknowledged with 200 —\n-- a decided application has no transition a late callback could take.\nselect * from app.apply_provider_event($1, $2, $3, $4::bigint, $5::jsonb, $6, $7::app.application_state, $8, $9);",
         "options": {
-          "queryReplacement": "={{ [ $json.event_id, $json.provider_ref, String($json.decision), $json.sequence_no, JSON.stringify($json.payload) ] }}"
+          "queryReplacement": "={{ [ $json.event_id, $json.provider_ref, $json.event_type, $json.sequence_no, JSON.stringify($json.payload), $json.client_reference, $json.next, $json.reason, String($execution.id) ] }}"
         }
       },
-      "id": "06496a30-4f3a-5f7a-bb28-e6ec8008c340",
-      "name": "PG: record provider event",
+      "id": "9cc8acd2-2f2b-5817-9ad0-6dddc72d572b",
+      "name": "PG: apply provider event",
       "type": "n8n-nodes-base.postgres",
       "typeVersion": 2.5,
       "position": [
         -240,
         520
-      ],
-      "credentials": {
-        "postgres": {
-          "id": "REPLACE_ME",
-          "name": "Onboarding DB (service_role)"
-        }
-      }
-    },
-    {
-      "parameters": {
-        "conditions": {
-          "options": {
-            "caseSensitive": true,
-            "typeValidation": "strict",
-            "version": 2
-          },
-          "conditions": [
-            {
-              "id": "10bbc54f-ffe1-57c2-b74d-fd4de27bcbe9",
-              "leftValue": "={{ $json.is_new }}",
-              "rightValue": "={{ true }}",
-              "operator": {
-                "type": "boolean",
-                "operation": "equals"
-              }
-            }
-          ],
-          "combinator": "and"
-        },
-        "options": {}
-      },
-      "id": "56801b27-9fbe-5e4e-a4c4-1269707213b2",
-      "name": "IF: new event?",
-      "type": "n8n-nodes-base.if",
-      "typeVersion": 2.2,
-      "position": [
-        -20,
-        520
-      ]
-    },
-    {
-      "parameters": {
-        "jsCode": "// Back to the verified event (the Postgres step replaced $json).\nreturn [{ json: $('Verify HMAC (raw body)').first().json }];\n"
-      },
-      "id": "99445a16-2350-5614-96ea-3a385a3aecc2",
-      "name": "Decision from event",
-      "type": "n8n-nodes-base.code",
-      "typeVersion": 2,
-      "position": [
-        200,
-        420
-      ]
-    },
-    {
-      "parameters": {
-        "operation": "executeQuery",
-        "query": "-- A stale or out-of-order callback needs no special handling: a decided\n-- application has no allowed transition, so the database answers\n-- 'forbidden' and nothing changes. The callback is still acknowledged.\n\n-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
-        "options": {
-          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
-        }
-      },
-      "id": "5c059e1c-1a1c-55c3-a59f-a69b863daef5",
-      "name": "PG: apply decision",
-      "type": "n8n-nodes-base.postgres",
-      "typeVersion": 2.5,
-      "position": [
-        420,
-        420
       ],
       "credentials": {
         "postgres": {
@@ -699,7 +640,7 @@
     {
       "parameters": {
         "operation": "executeQuery",
-        "query": "-- SKIP LOCKED: run as many reconciler workers as you like, none of them\n-- will ever resolve the same application twice. Claiming also pushes the\n-- next attempt out (exponential back-off with jitter).\nselect * from app.claim_unknown_applications(25);"
+        "query": "-- SKIP LOCKED keeps concurrent workers off the same rows, and claiming\n-- pushes the next attempt out (exponential back-off with jitter). If a pass\n-- outlives that lease, the transition keys make a repeat harmless.\nselect * from app.claim_unknown_applications(25);"
       },
       "id": "a5d43fcc-7bfe-500e-b261-2276ca2f53a7",
       "name": "PG: claim UNKNOWN",
@@ -740,6 +681,7 @@
         -460,
         1000
       ],
+      "onError": "continueRegularOutput",
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 3000,
@@ -752,7 +694,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// QUERY FIRST, resubmit second — and only when we are certain the provider\n// never received it. Blind resubmission is how one applicant becomes two\n// identities. Handles every claimed application, not just the first.\nconst MAX_ATTEMPTS = 8;\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\nconst out = [];\n\n$input.all().forEach((item, i) => {\n  const res   = item.json;\n  const app   = $('PG: claim UNKNOWN').itemMatching(i).json;\n  const code  = res.statusCode ?? 0;\n  const check = res.body?.data?.[0];\n  const emit  = (next, reason, tkey) =>\n    out.push({ json: { application_id: app.id, next, reason, tkey,\n                       kyc_attempts: app.kyc_attempts }, pairedItem: i });\n\n  if (code === 200 && check && check.status === 'complete') {\n    // Found, and finished → apply the real decision.\n    emit(decisionMap[check.result] ?? 'kyc_review', `reconciled_${check.result}`, `recon:${app.id}:${check.id}`);\n  } else if (code === 200 && check) {\n    // Found, still running → leave it; back-off is already re-armed.\n  } else if (code === 200 && !check && app.kyc_attempts < MAX_ATTEMPTS) {\n    // Definitively never received → resubmit with the SAME idempotency key.\n    emit('kyc_pending', 'never_received_resubmitting_same_key', `rearm:${app.id}:${app.kyc_attempts}`);\n  } else if (app.kyc_attempts >= MAX_ATTEMPTS) {\n    // Budget spent (or provider still unreachable on the last try) → a human\n    // owns it now. Note: kyc_review, never rejected.\n    emit('kyc_review', 'reconcile_exhausted', `giveup:${app.id}`);\n  }\n  // else: provider unreachable, budget left → try again next pass.\n});\nreturn out;\n"
+        "jsCode": "// QUERY FIRST, resubmit second — and only when we are certain the provider\n// never received it. Blind resubmission is how one applicant becomes two\n// identities. Handles every claimed application, not just the first.\nconst MAX_ATTEMPTS = 8;\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\nconst out = [];\n\n$input.all().forEach((item, i) => {\n  const res   = item.json;\n  const app   = $('PG: claim UNKNOWN').itemMatching(i).json;\n  const code  = res.statusCode ?? 0;\n  const check = res.body?.data?.[0];\n  const emit  = (next, reason, tkey) =>\n    out.push({ json: { application_id: app.id, next, reason, tkey,\n                       kyc_attempts: app.kyc_attempts }, pairedItem: i });\n\n  if (code === 200 && check && check.status === 'complete') {\n    // Found, and finished → apply the real decision.\n    emit(decisionMap[check.result] ?? 'kyc_review', `reconciled_${check.result}`, `recon:${app.id}:${check.id}`);\n  } else if (app.kyc_attempts >= MAX_ATTEMPTS) {\n    // Budget spent — still processing, never received, or unreachable — so a\n    // human owns it now. Note: kyc_review, never rejected.\n    emit('kyc_review', 'reconcile_exhausted', `giveup:${app.id}`);\n  } else if (code === 200 && check) {\n    // Found, still running → leave it; back-off is already re-armed.\n  } else if (code === 200 && !check) {\n    // Definitively never received → resubmit with the SAME idempotency key.\n    emit('kyc_pending', 'never_received_resubmitting_same_key', `rearm:${app.id}:${app.kyc_attempts}`);\n  }\n  // else: provider unreachable, budget left → try again next pass.\n});\nreturn out;\n"
       },
       "id": "7457efa6-a68d-5953-a0e8-95c3a56da485",
       "name": "Resolve or re-arm",
@@ -854,6 +796,7 @@
         420,
         900
       ],
+      "onError": "continueRegularOutput",
       "retryOnFail": true,
       "maxTries": 2,
       "waitBetweenTries": 3000,
@@ -1216,7 +1159,7 @@
       "main": [
         [
           {
-            "node": "PG: record provider event",
+            "node": "PG: apply provider event",
             "type": "main",
             "index": 0
           }
@@ -1230,47 +1173,7 @@
         ]
       ]
     },
-    "PG: record provider event": {
-      "main": [
-        [
-          {
-            "node": "IF: new event?",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "IF: new event?": {
-      "main": [
-        [
-          {
-            "node": "Decision from event",
-            "type": "main",
-            "index": 0
-          }
-        ],
-        [
-          {
-            "node": "Respond 200",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "Decision from event": {
-      "main": [
-        [
-          {
-            "node": "PG: apply decision",
-            "type": "main",
-            "index": 0
-          }
-        ]
-      ]
-    },
-    "PG: apply decision": {
+    "PG: apply provider event": {
       "main": [
         [
           {

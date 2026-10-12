@@ -3,7 +3,7 @@
 A reference implementation, not a client system: the actual artifacts, so you
 can disagree with the decisions.
 
-> **Status.** The database layer and the workflow logic are tested — 29 tests
+> **Status.** The database layer and the workflow logic are tested — 44 tests
 > run the workflow's own SQL and JavaScript against real Postgres 16 (PGlite)
 > with a stubbed screening service and KYC provider (`npm test`). It has **not**
 > been run inside a live n8n instance or against a real KYC or screening
@@ -13,8 +13,8 @@ can disagree with the decisions.
 |---|---|
 | `onboarding.bpmn` | BPMN 2.0 — opens in [bpmn.io](https://demo.bpmn.io) or Camunda Modeler |
 | `schema.sql` | Postgres: states, allowed transitions, the functions the orchestrator may call, audit, review queue |
-| `workflow.n8n.json` | n8n workflow — importable; 40 nodes, 3 entry points (submit, provider callback, reconciler) |
-| `openapi.yaml` | The API contract, including what each 409 means |
+| `workflow.n8n.json` | n8n workflow — importable; 37 nodes, 3 entry points (submit, provider callback, reconciler) |
+| `openapi.yaml` | The API contract — public statuses, auth, and what each 409 means |
 | `postman_collection.json` | 7 requests — 4 of them are the failure cases |
 | `tests/` | `schema.test.mjs` (the rules in the database) · `workflow.test.mjs` (the workflow, executed node by node) · `harness.mjs` |
 
@@ -55,7 +55,7 @@ the database, not by a convention someone has to remember.
 
 ---
 
-## Six decisions worth arguing about
+## Seven decisions worth arguing about
 
 **1. A timeout is `kyc_unknown`, never `rejected`.**
 Declining a customer because our network hiccuped is a compliance incident, not
@@ -73,11 +73,13 @@ reuses the *same* `Idempotency-Key` as the original submit.
 
 **3. The orchestrator never writes state — and can't.**
 The workflow's database role (`service_role`) has no table privileges at all,
-only `EXECUTE` on six functions. `app.transition_application()` locks the row,
-checks the transition table, then writes state **and** the audit row in one
-transaction, and is idempotent on a transition key. It returns
-`applied | duplicate | forbidden | not_found` rather than raising — an exception
-would roll back the caller's own bookkeeping.
+only `EXECUTE` on six functions, and it may only act as `system`.
+`app.transition_application()` locks the row, checks the transition table, then
+writes state **and** the audit row in one transaction. It is idempotent on a
+transition key — and the same key asking for a *different* target is a
+`key_conflict`, not a silent duplicate. It returns
+`applied | duplicate | forbidden | not_found | key_conflict` rather than raising —
+an exception would roll back the caller's own bookkeeping.
 
 **4. Intent is recorded before the side effect.**
 `screening → kyc_pending` is written *before* the KYC provider is called. If
@@ -94,12 +96,25 @@ banking is unavailable *after* approval, the compensation is retry and an ops
 queue — **not** un-approving the customer (the non-interrupting boundary event
 on `Task_OpenAccount`).
 
-**6. Human review is a control, not a fallback.**
+**6. Human review is a control, not a fallback — and maker–checker is enforced, not described.**
 A sanctions hit, unavailable screening, a provider `REFER` and an exhausted
 reconciliation all land in `app.review_task`. The task is opened **by the
 transition function** whenever an application enters `kyc_review`, so no
 workflow branch can forget it, and there is at most one open task per
-application. Maker–checker is a `check (checker_id <> maker_id)` constraint.
+application. The only way out of review is two calls by two people:
+`app.propose_review(task, maker, outcome, note)` then
+`app.decide_review(task, checker)`. Both belong to a separate `review_app` role
+that the orchestrator does not have; `decide_review` refuses a missing proposal
+or a checker who is the maker, and the table's
+`check (checker_id is null or (maker_id is not null and checker_id <> maker_id))`
+backs that up. A decided task is closed, so the next trip into review opens a
+fresh one.
+
+**7. Internal states never leave the bank.**
+Telling an applicant `kyc_review` after a sanctions hit is tipping-off. The API
+answers with a coarse public status — `received | in_progress | approved |
+declined | expired` — and the submit webhook requires an API key (n8n header
+auth). Put it behind your gateway as well.
 
 ---
 
@@ -119,11 +134,14 @@ Four separate concerns, all mandatory, in this order:
 4. **Only then** read the contents.
 
 Delivery is at-least-once and unordered, so on top of the signature:
-`app.record_provider_event` inserts on the provider's `event_id` with
-`ON CONFLICT DO NOTHING` and reports whether the event is new, and the
-transition is keyed on that `event_id`, so the same event can never move the
-state twice. `sequence_no` is recorded for audit; ordering safety comes from
-the transition table (decision 5), not from comparing sequence numbers.
+`app.apply_provider_event` records the event **and** applies its decision in one
+transaction, keyed on the provider's `event_id`. If applying fails, nothing is
+recorded, so the provider's redelivery is processed rather than dropped as
+"already seen"; a genuine duplicate is acknowledged without touching state.
+Only `CLEAR`, `DECLINE` and `REFER` move state — lifecycle events
+(`check.started`, …) are recorded and acknowledged. `sequence_no` is recorded
+for audit; ordering safety comes from the transition table (decision 5), not
+from comparing sequence numbers.
 
 ---
 
@@ -148,8 +166,8 @@ returns one of:
 
 | outcome | HTTP | meaning |
 |---|---|---|
-| `created` | 201 | new application; response carries the state it reached |
-| `replay` | 200 | same key, same payload — current state returned, process **not** restarted |
+| `created` | 201 | new application; response carries the public status it reached |
+| `replay` | 200 | same key, same payload — current public status, process **not** restarted |
 | `key_conflict` | 409 | same key, different payload |
 | `already_open` | 409 | a live application already exists for this customer + product under another key |
 
@@ -166,26 +184,32 @@ a decline is an audited state, not a lost HTTP error.
 
 ```bash
 npm install
-npm test      # 29 tests, ~40 s — no database server or n8n needed
+npm test      # 44 tests, ~60 s — no database server or n8n needed
 ```
 
 - `schema.test.mjs` — the orchestrator role cannot read or write any table;
   submit outcomes; illegal transitions refused; approval irreversible; one open
-  review task; four-eyes constraint; `kyc_unknown` scheduled, claimed when due,
-  backed off; provider-event dedupe.
+  review task; the orchestrator cannot act as a reviewer; propose + decide by
+  two different people (and not one); a closed task makes way for a new one;
+  transition-key conflicts; `kyc_unknown` scheduled, claimed when due, backed
+  off; provider events recorded and applied together.
 - `workflow.test.mjs` — loads `workflow.n8n.json` and executes it node by node:
   happy path to `approved`; replay; 409 on a swapped applicant; derived key;
   `already_open`; 400; ineligible; sanctions hit (KYC never called); screening
-  down; provider timeout; replayed and late callbacks; tampered / stale /
-  wrong-secret / missing-secret signatures; raw-bytes verification; the
-  reconciler handling found, still-running and never-received applications in
-  one pass with the same idempotency key; exhausted budget; callback SLA.
+  down or timing out; provider 5xx and a real (thrown) timeout; no internal
+  state in responses; replayed, late and lifecycle callbacks; an unusable
+  `client_reference`; tampered / stale / wrong-secret / missing-secret
+  signatures; raw-bytes verification; the reconciler handling found,
+  still-running and never-received applications in one pass with the same
+  idempotency key; budget exhausted while still processing, or left at the
+  limit after a crash; callback SLA.
 
 `harness.mjs` is a small interpreter for exactly the node types this workflow
-uses (Code, IF, Postgres, HTTP Request, Respond to Webhook). It runs the
-workflow's own SQL and JavaScript, so a red test means the shipped workflow is
-wrong — but it is not n8n, and it does not prove n8n-specific behaviour such as
-retries, credentials or execution settings.
+uses (Code, IF, Postgres, HTTP Request, Respond to Webhook), including n8n's
+rule that a thrown HTTP error stops the execution unless the node continues on
+error. It runs the workflow's own SQL and JavaScript, so a red test means the
+shipped workflow is wrong — but it is not n8n, and it does not prove
+n8n-specific behaviour such as retries, credentials or execution settings.
 
 ---
 
@@ -194,13 +218,14 @@ retries, credentials or execution settings.
 ```bash
 psql "$DATABASE_URL" -f schema.sql
 psql "$DATABASE_URL" -c "create role onboarding_app login password '…'; grant service_role to onboarding_app;"
+psql "$DATABASE_URL" -c "create role review_tool login password '…'; grant review_app to review_tool;"
 ```
 
 Then in n8n: **Import from file → `workflow.n8n.json`**, and
 
-- create a Postgres credential that logs in as `onboarding_app`, and an HTTP
-  Header Auth credential for the KYC provider; assign both where the nodes say
-  `REPLACE_ME`;
+- create a Postgres credential that logs in as `onboarding_app`, an HTTP
+  Header Auth credential for the KYC provider, and one for clients calling the
+  submit webhook (`X-Api-Key`); assign them where the nodes say `REPLACE_ME`;
 - set `KYC_PROVIDER_URL`, `SCREENING_URL`, `KYC_WEBHOOK_SECRET`, `PUBLIC_BASE_URL`;
 - allow the Code nodes what they use: `NODE_FUNCTION_ALLOW_BUILTIN=crypto`, and
   `$env` access (`N8N_BLOCK_ENV_ACCESS_IN_NODE=false`) — or move the secret into
@@ -221,6 +246,14 @@ little; a 409 on key reuse and a 401 on a tampered body prove the controls exist
   service from the workflow, and n8n retains execution payloads — for a bank,
   pass applicant data by reference and shorten execution retention.
 - **No account opening or review UI.** The BPMN models them; the workflow stops
-  at the decision.
+  at the decision, and the review tool is whatever calls `propose_review` /
+  `decide_review`.
+- **Retries cover transport errors only.** HTTP nodes return non-2xx responses
+  as data (`neverError`), so `retryOnFail` retries timeouts and resets, not a
+  503 — one screening blip sends the applicant to review (the safe direction).
+- **Submit is synchronous.** Screening and the KYC call happen before the
+  response; a production API would accept with 202 and continue asynchronously.
+- **Not yet:** matching a callback's `check_id` to the stored `provider_ref`,
+  webhook-secret rotation, and alerting on acknowledged-but-unknown references.
 - **Not tuned for scale.** The reconciler claims 25 rows per pass with
   `FOR UPDATE SKIP LOCKED`; the shape is right, the numbers are illustrative.
