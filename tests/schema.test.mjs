@@ -151,11 +151,11 @@ test('maker-checker: the orchestrator cannot act as a reviewer', async () => {
 test('maker-checker: the same person cannot propose and decide; two people can', async () => {
   const db = await freshDb()
   const { id, task } = await inReview(db)
-  await asReviewer(db, "select * from app.propose_review($1, 'alice', 'approve', 'docs ok')", [task])
+  await asReviewer(db, "select * from app.propose_review($1, 'alice', 'reject', 'documents forged')", [task])
   const same = (await asReviewer(db, "select * from app.decide_review($1, 'alice')", [task]))[0]
   assert.equal(same.result, 'forbidden')
   const ok = (await asReviewer(db, "select * from app.decide_review($1, 'bob')", [task]))[0]
-  assert.deepEqual([ok.result, ok.state], ['applied', 'approved'])
+  assert.deepEqual([ok.result, ok.state], ['applied', 'rejected'])
   const [t] = await asAdmin(db, 'select maker_id, checker_id, checker_at from app.review_task where id=$1', [task])
   assert.deepEqual([t.maker_id, t.checker_id, Boolean(t.checker_at)], ['alice', 'bob', true])
 })
@@ -200,4 +200,17 @@ test('provider event: recorded and applied in one call; lifecycle events and unk
   assert.deepEqual(Object.values(await apply('e1', id, 'approved')).slice(0, 2), [false, 'duplicate'])
   assert.equal((await apply('e2', id, null)).result, 'ignored')
   assert.equal((await apply('e3', 'not-a-uuid', 'approved')).result, 'not_found')
+})
+
+test('approving a REFER from the provider approves; review → kyc_pending starts a new KYC round', async () => {
+  const db = await freshDb()
+  const { application_id: id } = await submit(db, 'k1')
+  await move(db, id, 'screening', 's')
+  await move(db, id, 'kyc_pending', 'p')
+  await asService(db, "select * from app.transition_application($1::uuid,null,'kyc_review','system',null,'provider_REFER','refer')", [id])
+  const [t] = await asAdmin(db, 'select id from app.review_task where application_id=$1', [id])
+  await asReviewer(db, "select * from app.propose_review($1,'alice','approve','ok')", [t.id])
+  assert.equal((await asReviewer(db, "select * from app.decide_review($1,'bob')", [t.id]))[0].state, 'approved')
+  const [row] = await asAdmin(db, 'select kyc_round from app.application where id=$1', [id])
+  assert.equal(row.kyc_round, 1)
 })

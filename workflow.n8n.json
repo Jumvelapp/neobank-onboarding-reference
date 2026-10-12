@@ -236,7 +236,7 @@
       "credentials": {
         "httpHeaderAuth": {
           "id": "REPLACE_ME",
-          "name": "KYC provider API key"
+          "name": "Screening service API key"
         }
       }
     },
@@ -328,13 +328,13 @@
           "parameters": [
             {
               "name": "Idempotency-Key",
-              "value": "={{ $json.application_id }}:kyc"
+              "value": "={{ $json.application_id }}:kyc:{{ $json.kyc_round }}"
             }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
+        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id + ':' + $json.kyc_round, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
       },
       "id": "837dd39a-1a86-50b7-8930-06a777fe4cad",
       "name": "Submit to KYC provider",
@@ -357,7 +357,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: transition (screening)').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:submit-result` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:submit-result` }, pairedItem: i });\n  }\n});\nreturn out;\n"
+        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: transition (screening)').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:submit:v${app.version}` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:submit:v${app.version}` }, pairedItem: i });\n  }\n});\nreturn out;\n"
       },
       "id": "d23004ab-bf66-5866-8954-ca3e6db77b3b",
       "name": "Classify submit result",
@@ -660,7 +660,7 @@
     {
       "parameters": {
         "method": "GET",
-        "url": "={{ $env.KYC_PROVIDER_URL }}/checks?client_reference={{ $json.id }}",
+        "url": "={{ $env.KYC_PROVIDER_URL }}/checks?client_reference={{ $json.id }}:{{ $json.kyc_round }}",
         "authentication": "genericCredentialType",
         "genericAuthType": "httpHeaderAuth",
         "options": {
@@ -694,7 +694,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// QUERY FIRST, resubmit second — and only when we are certain the provider\n// never received it. Blind resubmission is how one applicant becomes two\n// identities. Handles every claimed application, not just the first.\nconst MAX_ATTEMPTS = 8;\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\nconst out = [];\n\n$input.all().forEach((item, i) => {\n  const res   = item.json;\n  const app   = $('PG: claim UNKNOWN').itemMatching(i).json;\n  const code  = res.statusCode ?? 0;\n  const check = res.body?.data?.[0];\n  const emit  = (next, reason, tkey) =>\n    out.push({ json: { application_id: app.id, next, reason, tkey,\n                       kyc_attempts: app.kyc_attempts }, pairedItem: i });\n\n  if (code === 200 && check && check.status === 'complete') {\n    // Found, and finished → apply the real decision.\n    emit(decisionMap[check.result] ?? 'kyc_review', `reconciled_${check.result}`, `recon:${app.id}:${check.id}`);\n  } else if (app.kyc_attempts >= MAX_ATTEMPTS) {\n    // Budget spent — still processing, never received, or unreachable — so a\n    // human owns it now. Note: kyc_review, never rejected.\n    emit('kyc_review', 'reconcile_exhausted', `giveup:${app.id}`);\n  } else if (code === 200 && check) {\n    // Found, still running → leave it; back-off is already re-armed.\n  } else if (code === 200 && !check) {\n    // Definitively never received → resubmit with the SAME idempotency key.\n    emit('kyc_pending', 'never_received_resubmitting_same_key', `rearm:${app.id}:${app.kyc_attempts}`);\n  }\n  // else: provider unreachable, budget left → try again next pass.\n});\nreturn out;\n"
+        "jsCode": "// QUERY FIRST, resubmit second — and only when we are certain the provider\n// never received it. Blind resubmission is how one applicant becomes two\n// identities. Handles every claimed application, not just the first.\n// Transition keys carry the state version: the same provider answer seen in a\n// later trip through kyc_unknown is a new transition, not a \"duplicate\".\nconst MAX_ATTEMPTS = 8;\nconst decisionMap = { CLEAR: 'approved', DECLINE: 'rejected', REFER: 'kyc_review' };\nconst out = [];\n\n$input.all().forEach((item, i) => {\n  const res   = item.json;\n  const app   = $('PG: claim UNKNOWN').itemMatching(i).json;\n  const code  = res.statusCode ?? 0;\n  const check = res.body?.data?.[0];\n  const emit  = (next, reason, tkey) =>\n    out.push({ json: { application_id: app.id, next, reason, tkey,\n                       kyc_attempts: app.kyc_attempts }, pairedItem: i });\n\n  if (code === 200 && check && check.status === 'complete') {\n    // Found, and finished → apply the real decision.\n    emit(decisionMap[check.result] ?? 'kyc_review', `reconciled_${check.result}`, `recon:${app.id}:v${app.version}`);\n  } else if (app.kyc_attempts >= MAX_ATTEMPTS) {\n    // Budget spent — still processing, never received, or unreachable — so a\n    // human owns it now. Note: kyc_review, never rejected.\n    emit('kyc_review', 'reconcile_exhausted', `giveup:${app.id}:v${app.version}`);\n  } else if (code === 200 && check) {\n    // Found, still running → leave it; back-off is already re-armed.\n  } else if (code === 200 && !check) {\n    // Definitively never received → resubmit with the SAME idempotency key.\n    emit('kyc_pending', 'never_received_resubmitting_same_key', `rearm:${app.id}:v${app.version}`);\n  }\n  // else: provider unreachable, budget left → try again next pass.\n});\nreturn out;\n"
       },
       "id": "7457efa6-a68d-5953-a0e8-95c3a56da485",
       "name": "Resolve or re-arm",
@@ -780,13 +780,13 @@
           "parameters": [
             {
               "name": "Idempotency-Key",
-              "value": "={{ $json.application_id }}:kyc"
+              "value": "={{ $json.application_id }}:kyc:{{ $json.kyc_round }}"
             }
           ]
         },
         "sendBody": true,
         "specifyBody": "json",
-        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
+        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id + ':' + $json.kyc_round, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
       },
       "id": "21263104-aac6-53e7-96e5-5cd3a6f3920a",
       "name": "Resubmit to KYC (same key)",
@@ -809,7 +809,7 @@
     },
     {
       "parameters": {
-        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: apply reconciled state').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:resubmit:${$('Resolve or re-arm').itemMatching(i).json.kyc_attempts}` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:resubmit:${$('Resolve or re-arm').itemMatching(i).json.kyc_attempts}` }, pairedItem: i });\n  }\n});\nreturn out;\n"
+        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: apply reconciled state').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:resubmit:v${app.version}` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:resubmit:v${app.version}` }, pairedItem: i });\n  }\n});\nreturn out;\n"
       },
       "id": "e58ae59b-a97f-564e-abfa-f36fbd4c48e0",
       "name": "Classify resubmit result",
@@ -890,6 +890,164 @@
       "position": [
         1080,
         1000
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- kyc_pending with no provider reference past a 2-minute lease: a new KYC\n-- round started by review, or a crash between recording kyc_pending and the\n-- provider call. Same round → same idempotency key → the provider de-duplicates.\nselect * from app.claim_pending_submissions(25, interval '2 minutes');"
+      },
+      "id": "0bda98d4-84a7-5657-b9c3-c54b8569c03d",
+      "name": "PG: claim pending submissions",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        -680,
+        1400
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.KYC_PROVIDER_URL }}/checks",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 20000,
+          "response": {
+            "response": {
+              "neverError": true,
+              "fullResponse": true
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $json.application_id }}:kyc:{{ $json.kyc_round }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ client_reference: $json.application_id + ':' + $json.kyc_round, callback_url: $env.PUBLIC_BASE_URL + '/webhook/onboarding/kyc-callback' }) }}"
+      },
+      "id": "50e06fa2-699a-5adb-9126-7a4eedbd7610",
+      "name": "Submit pending KYC round",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        -460,
+        1400
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "KYC provider API key"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// The whole point of this node: a timeout is NOT a decision.\n//\n// 2xx  → stays kyc_pending; the decision arrives later as a signed callback\n// 4xx  → the provider refused the request itself → a human looks (kyc_review)\n// 5xx / timeout / no response → kyc_unknown. We do not know whether the\n//        provider created the check. Resubmitting blind could double-charge\n//        the KYC vendor and, worse, create two identities.\nconst out = [];\n$input.all().forEach((item, i) => {\n  const res  = item.json;\n  const app  = $('PG: claim pending submissions').itemMatching(i).json;\n  const code = res.statusCode ?? 0;\n  const base = { application_id: app.application_id };\n  if (code >= 200 && code < 300) {\n    out.push({ json: { ...base, next: 'kyc_pending', provider_ref: res.body?.id ?? null }, pairedItem: i });\n  } else if (code >= 400 && code < 500) {\n    out.push({ json: { ...base, next: 'kyc_review', reason: `provider_rejected_request_${code}`,\n                        tkey: `${app.application_id}:pending-submit:v${app.version}` }, pairedItem: i });\n  } else {\n    out.push({ json: { ...base, next: 'kyc_unknown',\n                        reason: code === 0 ? 'timeout_no_response' : `provider_5xx_${code}`,\n                        tkey: `${app.application_id}:pending-submit:v${app.version}` }, pairedItem: i });\n  }\n});\nreturn out;\n"
+      },
+      "id": "cce2c34e-ac63-556c-a74e-8bbc58792416",
+      "name": "Classify pending submit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -240,
+        1400
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d10cc9ce-5072-590b-885a-4279bda868d7",
+              "leftValue": "={{ $json.next }}",
+              "rightValue": "kyc_pending",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "40b75382-bb7e-5364-bf87-83119e7f5ecc",
+      "name": "IF: pending accepted?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -20,
+        1400
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- 2xx from the provider: state stays kyc_pending, we only keep its reference.\nselect $1::uuid as application_id, r.* from app.record_provider_ref($1::uuid, $2) r;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.provider_ref ] }}"
+        }
+      },
+      "id": "565846e5-d321-5192-adba-aa4035831f7f",
+      "name": "PG: record provider ref (pending)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        200,
+        1300
+      ],
+      "credentials": {
+        "postgres": {
+          "id": "REPLACE_ME",
+          "name": "Onboarding DB (service_role)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "-- The workflow never UPDATEs state. It asks the database for a legal\n-- transition, and the database is the one that says no.\nselect $1::uuid as application_id, t.*\n  from app.transition_application(\n         $1::uuid,                    -- application\n         null,                        -- expected_from: the table decides\n         $2::app.application_state,   -- to\n         'system', $3, $4,            -- actor, actor_ref (execution), reason\n         $5                           -- transition idempotency key\n       ) t;",
+        "options": {
+          "queryReplacement": "={{ [ $json.application_id, $json.next, String($execution.id), $json.reason || \"\", $json.tkey ] }}"
+        }
+      },
+      "id": "017d0fb4-8595-5bd3-a612-59af6aa81973",
+      "name": "PG: transition (pending submit result)",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        200,
+        1460
       ],
       "credentials": {
         "postgres": {
@@ -1184,11 +1342,67 @@
         ]
       ]
     },
+    "PG: claim pending submissions": {
+      "main": [
+        [
+          {
+            "node": "Submit pending KYC round",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Submit pending KYC round": {
+      "main": [
+        [
+          {
+            "node": "Classify pending submit",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify pending submit": {
+      "main": [
+        [
+          {
+            "node": "IF: pending accepted?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: pending accepted?": {
+      "main": [
+        [
+          {
+            "node": "PG: record provider ref (pending)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "PG: transition (pending submit result)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Every 5 min: reconcile": {
       "main": [
         [
           {
             "node": "PG: flag overdue (SLA)",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "PG: claim pending submissions",
             "type": "main",
             "index": 0
           }

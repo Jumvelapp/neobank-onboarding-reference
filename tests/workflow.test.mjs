@@ -64,8 +64,8 @@ test('happy path: submit → screened → sent to KYC → signed CLEAR → appro
   assert.equal((await appRow(db, id)).state, 'kyc_pending')
 
   const kyc = calls.find((c) => c.node === 'Submit to KYC provider')
-  assert.equal(kyc.headers['Idempotency-Key'], `${id}:kyc`)
-  assert.equal(kyc.body.client_reference, id)
+  assert.equal(kyc.headers['Idempotency-Key'], `${id}:kyc:1`)
+  assert.equal(kyc.body.client_reference, `${id}:1`)
   assert.equal((await appRow(db, id)).provider_ref, 'chk-1')
 
   const cb = await callback(db, signed({ event_id: 'evt-1', check_id: 'chk-1', client_reference: id, sequence: 1, decision: 'CLEAR' }))
@@ -232,7 +232,7 @@ test('reconcile: every claimed application is handled — found, still running, 
   const { calls } = await run('Every 5 min: reconcile', [{ json: {} }], {
     db, env,
     http: {
-      'Query provider by our ref': (req) => ({ statusCode: 200, body: provider[new URL(req.url).searchParams.get('client_reference')] }),
+      'Query provider by our ref': (req) => ({ statusCode: 200, body: provider[new URL(req.url).searchParams.get('client_reference').split(':')[0]] }),
       'Resubmit to KYC (same key)': () => ({ statusCode: 201, body: { id: 'chk-new' } }),
     },
   })
@@ -245,7 +245,7 @@ test('reconcile: every claimed application is handled — found, still running, 
 
   const resubmits = calls.filter((c) => c.node === 'Resubmit to KYC (same key)')
   assert.equal(resubmits.length, 1, 'only the never-received application is resubmitted')
-  assert.equal(resubmits[0].headers['Idempotency-Key'], `${lost}:kyc`, 'same idempotency key as the original submit')
+  assert.equal(resubmits[0].headers['Idempotency-Key'], `${lost}:kyc:1`, 'same idempotency key as the original submit')
 })
 
 test('reconcile: a resubmit that times out again goes back to kyc_unknown', async () => {
@@ -375,4 +375,118 @@ test('structure: the callback records and applies the event in one database call
   const pgNames = workflow.nodes.filter((n) => n.type === 'n8n-nodes-base.postgres').map((n) => n.parameters.query)
   assert.ok(pgNames.some((q) => /app\.apply_provider_event\(/.test(q)))
   assert.ok(!pgNames.some((q) => /app\.record_provider_event\(/.test(q)), 'no separate "seen" step before applying')
+})
+
+// ---------------------------------------------------------------- re-review 2026-10-12: KYC rounds
+const asReview = async (db, sql, p = []) => { await db.exec('set role review_app'); try { return (await db.query(sql, p)).rows } finally { await db.exec('reset role') } }
+async function decide(db, id, outcome) {
+  const [t] = await asAdmin(db, 'select id from app.review_task where application_id=$1 and checker_at is null', [id])
+  await asReview(db, 'select * from app.propose_review($1,$2,$3,$4)', [t.id, 'alice', outcome, 'note'])
+  return (await asReview(db, 'select * from app.decide_review($1,$2)', [t.id, 'bob']))[0]
+}
+const age = (db, id, interval) => asAdmin(db, `update app.application set updated_at = now() - interval '${interval}' where id=$1`, [id])
+const submitted = (calls) => calls.filter((c) => c.node === 'Submit pending KYC round')
+
+test('approving a review that was raised BEFORE any KYC check starts KYC — it never approves blind', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'K-1', product_code: 'P', applicant: applicant() },
+    { http: { 'Sanctions / PEP screening': () => ({ statusCode: 200, body: { matches: [{ list: 'EU', false_positive: true }] } }) } })
+  const id = response.body.application_id
+  const d = await decide(db, id, 'approve')
+  assert.equal(d.state, 'kyc_pending')
+  const row = await appRow(db, id)
+  assert.deepEqual([row.state, row.kyc_round, row.provider_ref], ['kyc_pending', 2, null])
+
+  await age(db, id, '3 minutes')
+  const { calls } = await run('Every 5 min: reconcile', [{ json: {} }], {
+    db, env, http: { 'Submit pending KYC round': () => ({ statusCode: 201, body: { id: 'chk-r2' } }) },
+  })
+  const sent = submitted(calls)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].headers['Idempotency-Key'], `${id}:kyc:2`)
+  assert.equal(sent[0].body.client_reference, `${id}:2`)
+  assert.equal((await appRow(db, id)).provider_ref, 'chk-r2')
+})
+
+test('more info after a REFER: a new round is submitted, and only its decision counts', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'K-2', product_code: 'P', applicant: applicant() })
+  const id = response.body.application_id
+  await callback(db, signed({ event_id: 'r1-refer', check_id: 'chk-1', client_reference: `${id}:1`, decision: 'REFER' }))
+  assert.equal((await appRow(db, id)).state, 'kyc_review')
+
+  assert.equal((await decide(db, id, 'request_more_info')).state, 'kyc_pending')
+  await age(db, id, '3 minutes')
+  await run('Every 5 min: reconcile', [{ json: {} }], {
+    db, env, http: { 'Submit pending KYC round': () => ({ statusCode: 201, body: { id: 'chk-2' } }) },
+  })
+
+  // A late callback from round 1 must not decide round 2.
+  await callback(db, signed({ event_id: 'r1-late', check_id: 'chk-1', client_reference: `${id}:1`, decision: 'DECLINE' }))
+  assert.equal((await appRow(db, id)).state, 'kyc_pending')
+
+  await callback(db, signed({ event_id: 'r2-clear', check_id: 'chk-2', client_reference: `${id}:2`, decision: 'CLEAR' }))
+  assert.equal((await appRow(db, id)).state, 'approved')
+})
+
+test('more info after the reconcile budget ran out: attempts reset, new round submitted, nothing stuck', async () => {
+  const db = await freshDb()
+  const id = await unknownApp(db, 'K-3')
+  await asAdmin(db, "update app.application set kyc_attempts = 7, next_attempt_at = now() - interval '1 second' where id=$1", [id])
+  await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: { 'Query provider by our ref': () => ({ statusCode: 503 }) } })
+  assert.equal((await appRow(db, id)).state, 'kyc_review')
+
+  await decide(db, id, 'request_more_info')
+  const row = await appRow(db, id)
+  assert.deepEqual([row.state, row.kyc_round, row.kyc_attempts], ['kyc_pending', 2, 0])
+  await age(db, id, '3 minutes')
+  const { calls } = await run('Every 5 min: reconcile', [{ json: {} }], {
+    db, env, http: { 'Submit pending KYC round': () => ({ statusCode: 201, body: { id: 'chk-3' } }) },
+  })
+  assert.equal(submitted(calls).length, 1)
+  assert.equal((await appRow(db, id)).provider_ref, 'chk-3')
+})
+
+test('reconcile keys are per state version: a second trip through the same branch is applied, not "duplicate"', async () => {
+  const db = await freshDb()
+  const id = await unknownApp(db, 'K-4')
+  const refer = { 'Query provider by our ref': () => ({ statusCode: 200, body: { data: [{ id: 'chk-x', status: 'complete', result: 'REFER' }] } }) }
+  await makeDue(db)
+  await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: refer })
+  assert.equal((await appRow(db, id)).state, 'kyc_review')
+  await decide(db, id, 'request_more_info')
+  await age(db, id, '3 minutes')
+  await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: { 'Submit pending KYC round': () => ({ statusCode: 504 }) } })
+  assert.equal((await appRow(db, id)).state, 'kyc_unknown')
+  await makeDue(db)
+  await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: refer })
+  assert.equal((await appRow(db, id)).state, 'kyc_review', 'same provider answer, new version → applied again')
+})
+
+test('a crash between recording kyc_pending and the provider call is recovered with the SAME round key', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'K-5', product_code: 'P', applicant: applicant() },
+    { http: { 'Submit to KYC provider': () => ({ statusCode: 201, body: {} }) } })   // 2xx but no id: as if we never got the ref
+  const id = response.body.application_id
+  assert.equal((await appRow(db, id)).provider_ref, null)
+  await age(db, id, '3 minutes')
+  const { calls } = await run('Every 5 min: reconcile', [{ json: {} }], {
+    db, env, http: { 'Submit pending KYC round': () => ({ statusCode: 200, body: { id: 'chk-dedup' } }) },
+  })
+  assert.equal(submitted(calls)[0].headers['Idempotency-Key'], `${id}:kyc:1`, 'same key → the provider de-duplicates')
+  assert.equal((await appRow(db, id)).provider_ref, 'chk-dedup')
+})
+
+test('a fresh kyc_pending (inside the lease) is not resubmitted', async () => {
+  const db = await freshDb()
+  const { response } = await submit(db, { customer_external_ref: 'K-6', product_code: 'P', applicant: applicant() },
+    { http: { 'Submit to KYC provider': () => ({ statusCode: 201, body: {} }) } })
+  const { calls } = await run('Every 5 min: reconcile', [{ json: {} }], { db, env, http: {} })
+  assert.equal(submitted(calls).length, 0)
+  assert.ok(response.body.application_id)
+})
+
+test('structure: screening and KYC use separate credentials', () => {
+  const cred = (name) => workflow.nodes.find((n) => n.name === name).credentials.httpHeaderAuth.name
+  assert.notEqual(cred('Sanctions / PEP screening'), cred('Submit to KYC provider'))
 })

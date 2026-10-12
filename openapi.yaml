@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: Neobank onboarding — KYC
-  version: "1.2.0"
+  version: "1.3.0"
   description: |
     Contract for the two webhooks in `workflow.n8n.json`. Paths match the
     workflow exactly (n8n serves them under `/webhook`).
@@ -181,7 +181,7 @@ components:
       properties:
         event_id:         { type: string, description: Dedupe and transition key. }
         check_id:         { type: string, description: The provider's id for the check. }
-        client_reference: { type: string, format: uuid, description: Our application id. }
+        client_reference: { type: string, example: '3f0c…-…:1', description: 'Echo of what we sent: "<application id>:<kyc round>". A decision for an earlier round is acknowledged and ignored.' }
         sequence:         { type: integer, description: Recorded for audit only. }
         event_type:       { type: string, description: 'Lifecycle events (e.g. check.started) are recorded and acknowledged; they never move state.' }
         decision:

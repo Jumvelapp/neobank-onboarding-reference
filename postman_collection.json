@@ -198,7 +198,7 @@
               "const body = JSON.stringify({",
               "  event_id: eventId,",
               "  check_id: 'chk-123',",
-              "  client_reference: pm.collectionVariables.get('applicationId'),",
+              "  client_reference: pm.collectionVariables.get('applicationId') + ':1',",
               "  sequence: 1,",
               "  decision: 'CLEAR'",
               "});",
@@ -330,7 +330,7 @@
         ],
         "body": {
           "mode": "raw",
-          "raw": "{\"event_id\":\"{{eventId}}\",\"check_id\":\"chk-123\",\"client_reference\":\"{{applicationId}}\",\"sequence\":1,\"decision\":\"CLEAR\",\"tampered\":true}"
+          "raw": "{\"event_id\":\"{{eventId}}\",\"check_id\":\"chk-123\",\"client_reference\":\"{{applicationId}}:1\",\"sequence\":1,\"decision\":\"CLEAR\",\"tampered\":true}"
         },
         "url": {
           "raw": "{{baseUrl}}/onboarding/kyc-callback",
@@ -355,7 +355,7 @@
               "// replay forever.",
               "const ts = (Math.floor(Date.now() / 1000) - 3600).toString();",
               "const body = JSON.stringify({ event_id: 'evt-stale', check_id: 'chk-9',",
-              "  client_reference: pm.collectionVariables.get('applicationId'), decision: 'CLEAR' });",
+              "  client_reference: pm.collectionVariables.get('applicationId') + ':1', decision: 'CLEAR' });",
               "pm.collectionVariables.set('staleBody', body);",
               "pm.collectionVariables.set('staleTs', ts);",
               "pm.collectionVariables.set('staleSig',",

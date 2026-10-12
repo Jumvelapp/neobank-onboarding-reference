@@ -50,6 +50,11 @@ create table app.application (
   reject_reason         text,
   applicant             jsonb       not null default '{}'::jsonb,
 
+  -- A KYC round is one check at the provider. "More info" or approving a case
+  -- that never reached KYC starts a new round: new provider idempotency key,
+  -- new client reference, attempts reset — and late callbacks from an older
+  -- round can no longer decide anything.
+  kyc_round             int         not null default 1,
   kyc_attempts          int         not null default 0,
   next_attempt_at       timestamptz,
   submitted_at          timestamptz,
@@ -259,7 +264,7 @@ create or replace function app._apply_transition(
   p_reason          text,
   p_idempotency_key text,
   p_payload         jsonb default '{}'::jsonb
-) returns table (result text, state app.application_state, version bigint)
+) returns table (result text, state app.application_state, version bigint, kyc_round int)
 language plpgsql
 security definer
 set search_path = ''
@@ -267,18 +272,20 @@ as $$
 declare
   v_current app.application_state;
   v_version bigint;
+  v_round   int;
   v_allowed boolean;
   v_prior   app.application_event%rowtype;
+  v_new_round boolean;
 begin
   -- 1. Lock the row. Everything after this is serialised per application, so
   --    two concurrent calls with the same key resolve to applied + duplicate.
-  select a.state, a.version into v_current, v_version
+  select a.state, a.version, a.kyc_round into v_current, v_version, v_round
     from app.application a
    where a.id = p_application_id
    for update;
 
   if not found then
-    return query select 'not_found'::text, null::app.application_state, null::bigint;
+    return query select 'not_found'::text, null::app.application_state, null::bigint, null::int;
     return;
   end if;
 
@@ -291,16 +298,16 @@ begin
 
   if found then
     if v_prior.to_state = p_to then
-      return query select 'duplicate'::text, v_current, v_prior.version_after;
+      return query select 'duplicate'::text, v_current, v_prior.version_after, v_round;
     else
-      return query select 'key_conflict'::text, v_current, v_version;
+      return query select 'key_conflict'::text, v_current, v_version, v_round;
     end if;
     return;
   end if;
 
   -- 3. Optional optimistic guard.
   if p_expected_from is not null and v_current <> p_expected_from then
-    return query select 'forbidden'::text, v_current, v_version;
+    return query select 'forbidden'::text, v_current, v_version, v_round;
     return;
   end if;
 
@@ -313,13 +320,17 @@ begin
   ) into v_allowed;
 
   if not v_allowed then
-    return query select 'forbidden'::text, v_current, v_version;
+    return query select 'forbidden'::text, v_current, v_version, v_round;
     return;
   end if;
 
   -- 5. Apply. State + audit together or not at all.
+  v_new_round := v_current = 'kyc_review' and p_to = 'kyc_pending';
   update app.application a
      set state           = p_to,
+         kyc_round       = case when v_new_round then a.kyc_round + 1 else a.kyc_round end,
+         kyc_attempts    = case when v_new_round then 0 else a.kyc_attempts end,
+         provider_ref    = case when v_new_round then null else a.provider_ref end,
          version         = a.version + 1,
          updated_at      = now(),
          reject_reason   = case when p_to = 'rejected' then p_reason else a.reject_reason end,
@@ -328,7 +339,7 @@ begin
          next_attempt_at = case when p_to = 'kyc_unknown'
                                 then now() + interval '1 minute' else null end
    where a.id = p_application_id
-   returning a.version into v_version;
+   returning a.version, a.kyc_round into v_version, v_round;
 
   insert into app.application_event (
     application_id, from_state, to_state, actor, actor_ref,
@@ -344,7 +355,7 @@ begin
     on conflict do nothing;                    -- one open task per application
   end if;
 
-  return query select 'applied'::text, p_to, v_version;
+  return query select 'applied'::text, p_to, v_version, v_round;
 end;
 $$;
 
@@ -359,14 +370,14 @@ create or replace function app.transition_application(
   p_reason          text,
   p_idempotency_key text,
   p_payload         jsonb default '{}'::jsonb
-) returns table (result text, state app.application_state, version bigint)
+) returns table (result text, state app.application_state, version bigint, kyc_round int)
 language plpgsql
 security definer
 set search_path = ''
 as $$
 begin
   if p_actor is distinct from 'system' then
-    return query select 'forbidden'::text, null::app.application_state, null::bigint;
+    return query select 'forbidden'::text, null::app.application_state, null::bigint, null::int;
     return;
   end if;
   return query select * from app._apply_transition(p_application_id, p_expected_from, p_to,
@@ -412,11 +423,17 @@ begin
     return;
   end if;
 
+  -- "approve" only approves when the provider actually ran a check and said
+  -- REFER. A case raised before KYC (sanctions false positive, screening
+  -- down) or with an unknown KYC outcome goes on to KYC instead: a reviewer
+  -- clears the screening concern, the identity check still has to happen.
   select * into r from app._apply_transition(
     t.application_id, 'kyc_review',
-    case t.maker_outcome when 'approve' then 'approved'
-                         when 'reject'  then 'rejected'
-                         else 'kyc_pending' end::app.application_state,
+    case
+      when t.maker_outcome = 'reject' then 'rejected'
+      when t.maker_outcome = 'approve' and t.raised_reason in ('provider_REFER', 'reconciled_REFER') then 'approved'
+      else 'kyc_pending'
+    end::app.application_state,
     'reviewer', 'maker:' || t.maker_id || ' checker:' || p_checker_id,
     coalesce(t.maker_note, t.maker_outcome::text), 'review:' || t.id);
 
@@ -457,8 +474,11 @@ security definer
 set search_path = ''
 as $$
 declare
-  v_app uuid;
-  r     record;
+  v_app   uuid;
+  v_round int;
+  v_cur   int;
+  m       text[];
+  r       record;
 begin
   insert into app.provider_event (event_id, provider_ref, event_type, sequence_no, payload, client_reference)
   values (p_event_id, coalesce(p_provider_ref, ''), coalesce(p_event_type, ''), p_sequence_no,
@@ -476,12 +496,24 @@ begin
     return;
   end if;
 
-  if p_client_reference !~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' then
+  -- Our client reference is "<application id>:<kyc round>".
+  m := regexp_match(p_client_reference,
+         '^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?::([0-9]+))?$');
+  if m is null then
     update app.provider_event set result = 'not_found' where event_id = p_event_id;
     return query select true, 'not_found'::text, null::app.application_state;
     return;
   end if;
-  v_app := p_client_reference::uuid;
+  v_app   := m[1]::uuid;
+  v_round := m[2]::int;
+
+  select a.kyc_round into v_cur from app.application a where a.id = v_app;
+  if v_round is not null and v_cur is not null and v_round <> v_cur then
+    -- A decision about an earlier check. It may be genuine; it is not ours.
+    update app.provider_event set result = 'stale_round' where event_id = p_event_id;
+    return query select true, 'stale_round'::text, null::app.application_state;
+    return;
+  end if;
 
   select * into r from app._apply_transition(v_app, null, p_to, 'system', p_actor_ref,
                                              p_reason, 'event:' || p_event_id);
@@ -519,6 +551,35 @@ begin
   end loop;
   return query select n;
 end;
+$$;
+
+-- ---------------------------------------------------------------------------
+-- Pending submissions: kyc_pending with no provider reference, past a short
+-- lease. Covers a new round started by review, and a crash between recording
+-- kyc_pending and the provider call. Resubmitting is safe because the
+-- provider idempotency key is "<id>:kyc:<round>" — the same round is the same
+-- request. Claiming renews the lease so concurrent workers don't double up.
+-- ---------------------------------------------------------------------------
+create or replace function app.claim_pending_submissions(
+  p_limit int default 25, p_lease interval default interval '2 minutes'
+) returns table (application_id uuid, version bigint, kyc_round int)
+language sql
+security definer
+set search_path = ''
+as $$
+  with due as (
+    select id from app.application
+     where state = 'kyc_pending' and provider_ref is null
+       and updated_at < now() - p_lease
+     order by updated_at
+     limit p_limit
+     for update skip locked
+  )
+  update app.application a
+     set updated_at = now()
+    from due d
+   where a.id = d.id
+  returning a.id, a.version, a.kyc_round;
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -580,6 +641,7 @@ grant execute on function app.apply_provider_event(
 ) to service_role;
 grant execute on function app.claim_unknown_applications(int) to service_role;
 grant execute on function app.flag_overdue_pending(interval) to service_role;
+grant execute on function app.claim_pending_submissions(int, interval) to service_role;
 
 grant execute on function app.propose_review(uuid, text, app.review_outcome, text) to review_app;
 grant execute on function app.decide_review(uuid, text) to review_app;
